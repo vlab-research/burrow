@@ -5,142 +5,210 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 )
 
-// OffsetTracker tracks offset processing status for a single partition
-type OffsetTracker struct {
+// SequenceTracker tracks message processing using global sequence numbers
+// This replaces the per-partition OffsetTracker approach with a simpler
+// sequential tracking model that assigns monotonic sequence numbers to messages
+// as they arrive, regardless of partition.
+type SequenceTracker struct {
 	mu            sync.Mutex
-	partition     int32
-	processedMap  map[int64]bool // offset -> completed?
-	inflightMap   map[int64]bool // offset -> currently processing?
-	lastCommitted int64           // Last offset committed to Kafka
-	highWatermark int64           // Highest offset we've seen
+	messages      map[int64]MessageInfo // sequence → partition/offset mapping
+	processedMap  map[int64]bool        // sequence → completed?
+	inflightMap   map[int64]bool        // sequence → currently processing?
+	nextSequence  int64                 // atomic counter for sequence assignment
+	lastCommitted int64                 // last committed sequence
+	highWatermark int64                 // highest sequence seen
 	logger        *zap.Logger
 }
 
-// NewOffsetTracker creates a new tracker for a partition
-func NewOffsetTracker(partition int32, logger *zap.Logger) *OffsetTracker {
-	return &OffsetTracker{
-		partition:     partition,
+// NewSequenceTracker creates a new sequence tracker
+func NewSequenceTracker(logger *zap.Logger) *SequenceTracker {
+	return &SequenceTracker{
+		messages:      make(map[int64]MessageInfo),
 		processedMap:  make(map[int64]bool),
 		inflightMap:   make(map[int64]bool),
-		lastCommitted: -1, // No offsets committed yet
+		nextSequence:  0,
+		lastCommitted: -1, // No sequences committed yet
 		highWatermark: -1,
-		logger:        logger.With(zap.Int32("partition", partition)),
+		logger:        logger,
 	}
 }
 
-// RecordInflight marks an offset as currently being processed
-func (ot *OffsetTracker) RecordInflight(offset int64) {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
+// AssignSequence assigns the next sequence number to a message
+// This method is thread-safe and uses atomic operations for the counter
+func (st *SequenceTracker) AssignSequence(partition int32, offset int64) int64 {
+	// Atomically increment and get the next sequence number
+	seq := atomic.AddInt64(&st.nextSequence, 1) - 1
 
-	ot.inflightMap[offset] = true
-	if offset > ot.highWatermark {
-		ot.highWatermark = offset
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	// Store the partition/offset mapping for this sequence
+	st.messages[seq] = MessageInfo{
+		Partition: partition,
+		Offset:    offset,
 	}
 
-	ot.logger.Debug("recorded inflight",
-		zap.Int64("offset", offset),
-		zap.Int64("highWatermark", ot.highWatermark))
+	// Update high watermark
+	if seq > st.highWatermark {
+		st.highWatermark = seq
+	}
+
+	st.logger.Debug("assigned sequence",
+		zap.Int64("sequence", seq),
+		zap.Int32("partition", partition),
+		zap.Int64("offset", offset))
+
+	return seq
 }
 
-// MarkProcessed records that an offset has been successfully processed
-func (ot *OffsetTracker) MarkProcessed(offset int64) {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
+// RecordInflight marks a sequence as currently being processed
+func (st *SequenceTracker) RecordInflight(seq int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 
-	ot.processedMap[offset] = true
-	delete(ot.inflightMap, offset)
+	st.inflightMap[seq] = true
 
-	ot.logger.Debug("marked processed",
-		zap.Int64("offset", offset),
-		zap.Int("inflight", len(ot.inflightMap)),
-		zap.Int("processed", len(ot.processedMap)))
+	st.logger.Debug("recorded inflight",
+		zap.Int64("sequence", seq),
+		zap.Int("inflight_count", len(st.inflightMap)))
 }
 
-// MarkFailed records that an offset processing failed
-func (ot *OffsetTracker) MarkFailed(offset int64) {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
+// MarkProcessed marks a sequence as successfully completed
+func (st *SequenceTracker) MarkProcessed(seq int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 
-	// Don't mark as processed - leave gap!
-	delete(ot.inflightMap, offset)
+	st.processedMap[seq] = true
+	delete(st.inflightMap, seq)
 
-	ot.logger.Warn("marked failed",
-		zap.Int64("offset", offset),
-		zap.Int("inflight", len(ot.inflightMap)))
+	st.logger.Debug("marked processed",
+		zap.Int64("sequence", seq),
+		zap.Int("inflight", len(st.inflightMap)),
+		zap.Int("processed", len(st.processedMap)))
 }
 
-// GetCommittableOffset returns the highest offset that can be safely committed
-// This is the CORE ALGORITHM for gap detection!
-// Uses the pure function FindCommittableOffset for the core logic
-func (ot *OffsetTracker) GetCommittableOffset() int64 {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
+// MarkFailed marks a sequence as failed (leaves a gap for at-least-once semantics)
+func (st *SequenceTracker) MarkFailed(seq int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 
-	// Use pure function for gap detection logic
-	return FindCommittableOffset(ot.processedMap, ot.lastCommitted, ot.highWatermark)
+	// Don't mark as processed - this creates a gap!
+	delete(st.inflightMap, seq)
+
+	st.logger.Warn("marked failed",
+		zap.Int64("sequence", seq),
+		zap.Int("inflight", len(st.inflightMap)))
 }
 
-// GetLastCommitted returns the last committed offset
-func (ot *OffsetTracker) GetLastCommitted() int64 {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
-	return ot.lastCommitted
+// GetCommittableSequence returns the highest sequence that can be safely committed
+// Uses the pure gap detection algorithm from gap.go
+func (st *SequenceTracker) GetCommittableSequence() int64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	// Reuse the pure gap detection function
+	return FindCommittableOffset(st.processedMap, st.lastCommitted, st.highWatermark)
 }
 
-// CommitOffset updates the last committed offset and cleans up old entries
-func (ot *OffsetTracker) CommitOffset(offset int64) {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
+// GetCommittableOffsets converts the committable sequence range into
+// partition offsets suitable for Kafka commit.
+// This aggregates all committable sequences and returns the highest offset
+// per partition that can be safely committed.
+func (st *SequenceTracker) GetCommittableOffsets() map[int32]int64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 
-	ot.lastCommitted = offset
+	// Find the highest committable sequence
+	committableSeq := FindCommittableOffset(st.processedMap, st.lastCommitted, st.highWatermark)
 
-	// Clean up processed map to prevent memory leak
-	for o := range ot.processedMap {
-		if o <= offset {
-			delete(ot.processedMap, o)
+	// No progress since last commit
+	if committableSeq <= st.lastCommitted {
+		return make(map[int32]int64)
+	}
+
+	// Convert sequence range to highest offset per partition
+	offsetsByPartition := make(map[int32]int64)
+
+	for seq := st.lastCommitted + 1; seq <= committableSeq; seq++ {
+		if info, exists := st.messages[seq]; exists {
+			// Track the highest offset for each partition
+			if currentOffset, ok := offsetsByPartition[info.Partition]; !ok || info.Offset > currentOffset {
+				offsetsByPartition[info.Partition] = info.Offset
+			}
 		}
 	}
 
-	ot.logger.Info("committed offset",
-		zap.Int64("offset", offset),
-		zap.Int("remaining_tracked", len(ot.processedMap)))
+	st.logger.Info("computed committable offsets",
+		zap.Int64("committable_sequence", committableSeq),
+		zap.Int64("last_committed", st.lastCommitted),
+		zap.Any("offsets_by_partition", offsetsByPartition))
+
+	return offsetsByPartition
 }
 
-// GetInflightCount returns number of messages currently being processed
-func (ot *OffsetTracker) GetInflightCount() int {
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
-	return len(ot.inflightMap)
+// CommitSequence updates the last committed sequence and cleans up old data
+// to prevent memory leaks
+func (st *SequenceTracker) CommitSequence(seq int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	st.lastCommitted = seq
+
+	// Clean up old entries to prevent unbounded memory growth
+	for s := range st.processedMap {
+		if s <= seq {
+			delete(st.processedMap, s)
+			delete(st.messages, s)
+		}
+	}
+
+	st.logger.Info("committed sequence",
+		zap.Int64("sequence", seq),
+		zap.Int("remaining_tracked", len(st.processedMap)))
 }
 
-// WaitForInflight blocks until all inflight messages complete (for rebalance)
-// Returns error if timeout exceeded or context cancelled
-func (ot *OffsetTracker) WaitForInflight(ctx context.Context, timeout time.Duration) error {
+// GetInflightCount returns the number of messages currently being processed
+func (st *SequenceTracker) GetInflightCount() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.inflightMap)
+}
+
+// GetLastCommitted returns the last committed sequence number
+func (st *SequenceTracker) GetLastCommitted() int64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.lastCommitted
+}
+
+// WaitForInflight blocks until all inflight messages complete or timeout is reached
+// This is used during graceful shutdown and partition rebalancing
+func (st *SequenceTracker) WaitForInflight(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	// Log once at start if there are inflight messages
-	initialCount := ot.GetInflightCount()
+	initialCount := st.GetInflightCount()
 	if initialCount > 0 {
-		ot.logger.Info("waiting for inflight messages to complete",
+		st.logger.Info("waiting for inflight messages to complete",
 			zap.Int("inflight", initialCount))
 	}
 
 	for {
-		count := ot.GetInflightCount()
+		count := st.GetInflightCount()
 		if count == 0 {
 			return nil
 		}
 
 		if time.Now().After(deadline) {
-			ot.logger.Error("timeout waiting for inflight messages",
+			st.logger.Error("timeout waiting for inflight messages",
 				zap.Int("remaining", count),
 				zap.Duration("timeout", timeout))
 			return fmt.Errorf("timeout waiting for %d inflight messages", count)
@@ -148,11 +216,10 @@ func (ot *OffsetTracker) WaitForInflight(ctx context.Context, timeout time.Durat
 
 		select {
 		case <-ctx.Done():
-			ot.logger.Warn("context cancelled while waiting for inflight messages",
+			st.logger.Warn("context cancelled while waiting for inflight messages",
 				zap.Int("remaining", count))
 			return ctx.Err()
 		case <-ticker.C:
-			// Only log every second (10 ticks) to reduce spam
 			// Continue waiting
 		}
 	}

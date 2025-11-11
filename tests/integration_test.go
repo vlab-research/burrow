@@ -30,43 +30,47 @@ import (
 func TestIntegration_GapDetectionWithOutOfOrderCompletion(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 
-	// Create offset tracker
-	tracker := burrow.NewOffsetTracker(0, logger)
+	// Create sequence tracker
+	tracker := burrow.NewSequenceTracker(logger)
 
 	// Control completion order with channels
 	completionSignals := make(map[int64]chan struct{})
+	sequences := make([]int64, 5)
 	for i := int64(0); i <= 4; i++ {
 		completionSignals[i] = make(chan struct{})
 	}
 
-	// Track committable offset at each step
+	// Track committable sequence at each step
 	type commitStep struct {
-		afterOffset int64
-		committable int64
+		afterSequence int64
+		committable   int64
 	}
 	var steps []commitStep
 	var stepsMu sync.Mutex
 
-	// Record inflight for all messages
+	// Assign sequences and record inflight for all messages
 	for i := int64(0); i <= 4; i++ {
-		tracker.RecordInflight(i)
+		seq := tracker.AssignSequence(0, i) // partition 0, offset i
+		sequences[i] = seq
+		tracker.RecordInflight(seq)
 	}
 
 	// Process messages concurrently but control completion order
 	var wg sync.WaitGroup
 	for i := int64(0); i <= 4; i++ {
 		wg.Add(1)
-		go func(offset int64) {
+		go func(idx int64) {
 			defer wg.Done()
+			seq := sequences[idx]
 			// Wait for signal to complete
-			<-completionSignals[offset]
-			tracker.MarkProcessed(offset)
+			<-completionSignals[idx]
+			tracker.MarkProcessed(seq)
 
-			// Record committable offset after this completion
+			// Record committable sequence after this completion
 			stepsMu.Lock()
 			steps = append(steps, commitStep{
-				afterOffset: offset,
-				committable: tracker.GetCommittableOffset(),
+				afterSequence: seq,
+				committable:   tracker.GetCommittableSequence(),
 			})
 			stepsMu.Unlock()
 		}(i)
@@ -83,28 +87,29 @@ func TestIntegration_GapDetectionWithOutOfOrderCompletion(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify committable offsets at each step
+	// Verify committable sequences at each step
 	require.Len(t, steps, 5, "Should have recorded 5 steps")
 
 	// Sort steps by completion order for verification
 	stepsMap := make(map[int64]int64)
 	for _, step := range steps {
-		stepsMap[step.afterOffset] = step.committable
+		stepsMap[step.afterSequence] = step.committable
 	}
 
-	for i, offset := range completionOrder {
+	for i, idx := range completionOrder {
+		seq := sequences[idx]
 		expected := expectedCommittable[i]
-		actual := stepsMap[offset]
+		actual := stepsMap[seq]
 		assert.Equal(t, expected, actual,
-			"After completing offset %d, committable should be %d but got %d",
-			offset, expected, actual)
+			"After completing sequence %d, committable should be %d but got %d",
+			seq, expected, actual)
 	}
 
 	// Final committable should be 4 (all done)
-	finalCommittable := tracker.GetCommittableOffset()
+	finalCommittable := tracker.GetCommittableSequence()
 	assert.Equal(t, int64(4), finalCommittable, "All messages processed, should commit up to 4")
 
-	t.Logf("Gap detection test passed - committable offsets: %v", stepsMap)
+	t.Logf("Gap detection test passed - committable sequences: %v", stepsMap)
 }
 
 // ============================================================================
@@ -119,50 +124,56 @@ func TestIntegration_GapDetectionWithOutOfOrderCompletion(t *testing.T) {
 
 func TestIntegration_AtLeastOnceSemantics(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
-	// Process messages 0, 1, 2, 3, 4
+	// Assign sequences for messages 0, 1, 2, 3, 4
+	sequences := make([]int64, 5)
 	for i := int64(0); i <= 4; i++ {
-		tracker.RecordInflight(i)
+		seq := tracker.AssignSequence(0, i) // partition 0, offset i
+		sequences[i] = seq
+		tracker.RecordInflight(seq)
 	}
 
 	// Messages 0, 1 succeed
-	tracker.MarkProcessed(0)
-	tracker.MarkProcessed(1)
+	tracker.MarkProcessed(sequences[0])
+	tracker.MarkProcessed(sequences[1])
 
 	// Message 2 FAILS permanently (leaves gap)
-	tracker.MarkFailed(2)
+	tracker.MarkFailed(sequences[2])
 
 	// Messages 3, 4 succeed (but can't be committed due to gap)
-	tracker.MarkProcessed(3)
-	tracker.MarkProcessed(4)
+	tracker.MarkProcessed(sequences[3])
+	tracker.MarkProcessed(sequences[4])
 
-	// Verify committable offset is only 1 (blocked by gap at 2)
-	committable := tracker.GetCommittableOffset()
-	assert.Equal(t, int64(1), committable, "Should only commit up to 1 (gap at 2)")
+	// Verify committable sequence is only 1 (blocked by gap at 2)
+	committable := tracker.GetCommittableSequence()
+	assert.Equal(t, sequences[1], committable, "Should only commit up to sequence 1 (gap at 2)")
 
 	// Simulate commit
-	tracker.CommitOffset(1)
+	tracker.CommitSequence(sequences[1])
 	lastCommitted := tracker.GetLastCommitted()
-	assert.Equal(t, int64(1), lastCommitted, "Last committed should be 1")
+	assert.Equal(t, sequences[1], lastCommitted, "Last committed should be sequence 1")
 
 	// Simulate crash and restart
-	// On restart, Kafka consumer would seek to offset 2 (last committed + 1)
+	// On restart, Kafka consumer would seek to offset 2 (last committed offset + 1)
 	// So messages [2, 3, 4] would be reprocessed
 	//
 	// Create new tracker to simulate restart state
-	newTracker := burrow.NewOffsetTracker(0, logger)
-	newTracker.CommitOffset(1) // Start from last committed
+	newTracker := burrow.NewSequenceTracker(logger)
+	newTracker.CommitSequence(sequences[1]) // Start from last committed sequence
 
 	// Reprocess messages starting from offset 2
+	newSequences := make([]int64, 3)
 	for i := int64(2); i <= 4; i++ {
-		newTracker.RecordInflight(i)
-		newTracker.MarkProcessed(i)
+		seq := newTracker.AssignSequence(0, i)
+		newSequences[i-2] = seq
+		newTracker.RecordInflight(seq)
+		newTracker.MarkProcessed(seq)
 	}
 
 	// Now all messages are processed
-	committable = newTracker.GetCommittableOffset()
-	assert.Equal(t, int64(4), committable, "After reprocessing, should commit up to 4")
+	committable = newTracker.GetCommittableSequence()
+	assert.Equal(t, newSequences[2], committable, "After reprocessing, should commit up to last sequence")
 
 	t.Log("At-least-once semantics verified - failed messages block commits and are reprocessable")
 }
@@ -182,7 +193,15 @@ func TestIntegration_RebalancingSafety(t *testing.T) {
 	}
 
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
+
+	// Assign sequences for 5 messages and record them as inflight
+	sequences := make([]int64, 5)
+	for i := int64(0); i < 5; i++ {
+		seq := tracker.AssignSequence(0, i) // partition 0, offset i
+		sequences[i] = seq
+		tracker.RecordInflight(seq)
+	}
 
 	// Process 5 messages with controlled delays
 	inflightCount := int32(5)
@@ -191,13 +210,13 @@ func TestIntegration_RebalancingSafety(t *testing.T) {
 	// Start processing 5 messages concurrently
 	var wg sync.WaitGroup
 	for i := int64(0); i < 5; i++ {
-		tracker.RecordInflight(i)
 		wg.Add(1)
-		go func(offset int64) {
+		go func(idx int64) {
 			defer wg.Done()
+			seq := sequences[idx]
 			// Simulate processing time
 			time.Sleep(processDelay)
-			tracker.MarkProcessed(offset)
+			tracker.MarkProcessed(seq)
 			atomic.AddInt32(&inflightCount, -1)
 		}(i)
 	}
@@ -228,15 +247,12 @@ func TestIntegration_RebalancingSafety(t *testing.T) {
 	finalInflight := tracker.GetInflightCount()
 	assert.Equal(t, 0, finalInflight, "No messages should be inflight after wait")
 
-	// All messages should be processed
-	committable := tracker.GetCommittableOffset()
-	assert.Equal(t, int64(4), committable, "Should be able to commit all messages")
+	// All messages should be processed (last sequence should be committable)
+	committable := tracker.GetCommittableSequence()
+	assert.Equal(t, sequences[4], committable, "Should be able to commit all messages")
 
-	// Verify no data loss - all offsets processed
-	for i := int64(0); i < 5; i++ {
-		// Messages should be processed (not in inflight map)
-		assert.Equal(t, 0, tracker.GetInflightCount())
-	}
+	// Verify no data loss - no messages inflight
+	assert.Equal(t, 0, tracker.GetInflightCount(), "No messages should be inflight")
 
 	t.Logf("Rebalancing safety verified - waited %v for %d inflight messages", waitDuration, initialInflight)
 }
@@ -254,7 +270,7 @@ func TestIntegration_RebalancingSafety(t *testing.T) {
 func TestIntegration_ErrorThresholdHalt(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	errorTracker := burrow.NewErrorTracker(3, logger) // Max 3 consecutive errors
-	offsetTracker := burrow.NewOffsetTracker(0, logger)
+	offsetTracker := burrow.NewSequenceTracker(logger)
 
 	// Test pattern: [Fail, Fail, Success, Fail, Fail, Fail]
 	type testStep struct {
@@ -273,16 +289,20 @@ func TestIntegration_ErrorThresholdHalt(t *testing.T) {
 		{5, true, true, "Third consecutive failure - SHOULD HALT"},
 	}
 
-	for _, step := range steps {
-		offsetTracker.RecordInflight(step.offset)
+	// Assign sequences for all steps
+	sequences := make([]int64, len(steps))
+	for i, step := range steps {
+		seq := offsetTracker.AssignSequence(0, step.offset) // partition 0
+		sequences[i] = seq
+		offsetTracker.RecordInflight(seq)
 
 		if step.shouldFail {
-			offsetTracker.MarkFailed(step.offset)
+			offsetTracker.MarkFailed(seq)
 			shouldHalt := errorTracker.RecordError(0, step.offset, errors.New("test error"))
 			assert.Equal(t, step.shouldHalt, shouldHalt,
 				"Step %d (%s): halt expectation mismatch", step.offset, step.description)
 		} else {
-			offsetTracker.MarkProcessed(step.offset)
+			offsetTracker.MarkProcessed(seq)
 			errorTracker.RecordSuccess()
 		}
 
@@ -296,10 +316,10 @@ func TestIntegration_ErrorThresholdHalt(t *testing.T) {
 	assert.Equal(t, 3, consecutive, "Should have 3 consecutive errors")
 	assert.Equal(t, int64(5), total, "Should have 5 total errors")
 
-	// Verify committable offset - should only commit up to offset 1 (before first failure after reset)
-	// Offsets 0, 1 failed, 2 succeeded, 3-5 failed
+	// Verify committable sequence - should only commit up to sequence 1 (before first failure after reset)
+	// Sequences 0, 1 failed, 2 succeeded, 3-5 failed
 	// With gaps at 0, 1, 3, 4, 5 and only 2 processed, committable should be -1 (no contiguous from start)
-	committable := offsetTracker.GetCommittableOffset()
+	committable := offsetTracker.GetCommittableSequence()
 	assert.Equal(t, int64(-1), committable, "Should not commit anything due to gaps at beginning")
 
 	t.Log("Error threshold halt verified - halts after 3 consecutive errors")
@@ -323,10 +343,18 @@ func TestIntegration_ConcurrentSafetyUnderLoad(t *testing.T) {
 	// Run with: go test -race -run TestIntegration_ConcurrentSafetyUnderLoad
 
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	numMessages := int64(1000)
 	numWorkers := 100
+
+	// Assign sequences for all messages first
+	sequences := make([]int64, numMessages)
+	for i := int64(0); i < numMessages; i++ {
+		seq := tracker.AssignSequence(0, i) // partition 0, offset i
+		sequences[i] = seq
+		tracker.RecordInflight(seq)
+	}
 
 	// Create channels for work distribution
 	jobs := make(chan int64, numMessages)
@@ -341,25 +369,21 @@ func TestIntegration_ConcurrentSafetyUnderLoad(t *testing.T) {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for offset := range jobs {
+			for idx := range jobs {
+				seq := sequences[idx]
 				// Simulate random processing time (1-10ms for faster test)
-				delay := time.Duration(1+offset%10) * time.Millisecond
+				delay := time.Duration(1+idx%10) * time.Millisecond
 				time.Sleep(delay)
 
-				// Mark as processed
-				tracker.MarkProcessed(offset)
+				// Mark as processed using sequence
+				tracker.MarkProcessed(seq)
 				atomic.AddInt64(&processedCount, 1)
-				results <- offset
+				results <- seq
 			}
 		}(w)
 	}
 
-	// Record all messages as inflight first
-	for i := int64(0); i < numMessages; i++ {
-		tracker.RecordInflight(i)
-	}
-
-	// Submit all jobs
+	// Submit all jobs (indices into sequences array)
 	for i := int64(0); i < numMessages; i++ {
 		jobs <- i
 	}
@@ -380,9 +404,9 @@ func TestIntegration_ConcurrentSafetyUnderLoad(t *testing.T) {
 	assert.Equal(t, numMessages, resultCount, "All results should be collected")
 	assert.Equal(t, 0, tracker.GetInflightCount(), "No messages should be inflight")
 
-	// Verify committable offset is the last message
-	committable := tracker.GetCommittableOffset()
-	assert.Equal(t, numMessages-1, committable, "Should be able to commit all messages")
+	// Verify committable sequence is the last message
+	committable := tracker.GetCommittableSequence()
+	assert.Equal(t, sequences[numMessages-1], committable, "Should be able to commit all messages")
 
 	// Verify no data races (race detector will catch if any)
 	t.Logf("Concurrent safety verified - processed %d messages with %d workers", numMessages, numWorkers)
@@ -403,52 +427,57 @@ func TestIntegration_MemoryLeakPrevention(t *testing.T) {
 	}
 
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	numMessages := int64(10000)
 	commitInterval := int64(1000) // Commit every 1000 messages
 
 	// Process messages with periodic commits
 	for i := int64(0); i < numMessages; i++ {
-		tracker.RecordInflight(i)
-		tracker.MarkProcessed(i)
+		seq := tracker.AssignSequence(0, i) // partition 0, offset i
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 
 		// Commit every commitInterval messages
 		if (i+1)%commitInterval == 0 {
-			committable := tracker.GetCommittableOffset()
-			tracker.CommitOffset(committable)
+			committable := tracker.GetCommittableSequence()
+			tracker.CommitSequence(committable)
 
 			// Verify memory cleanup happens after each commit
-			// The tracker should only track uncommitted offsets
-			// Since we're processing sequentially, after commit there should be no tracked offsets
-			// (all have been cleaned up by CommitOffset)
+			// The tracker should only track uncommitted sequences
+			// Since we're processing sequentially, after commit there should be no tracked sequences
+			// (all have been cleaned up by CommitSequence)
 		}
 	}
 
 	// Final commit
-	committable := tracker.GetCommittableOffset()
-	tracker.CommitOffset(committable)
+	committable := tracker.GetCommittableSequence()
+	tracker.CommitSequence(committable)
+	lastSequence := committable
 
 	// Verify tracker has cleaned up processed map
-	// After commit, processedMap should be empty (all offsets <= committed are removed)
+	// After commit, processedMap should be empty (all sequences <= committed are removed)
 	// We can't directly inspect processedMap, but we can verify behavior:
 
-	// 1. Last committed should be the last message
-	assert.Equal(t, numMessages-1, tracker.GetLastCommitted(), "Should have committed all messages")
+	// 1. Last committed should be the last message sequence
+	assert.Equal(t, lastSequence, tracker.GetLastCommitted(), "Should have committed all messages")
 
 	// 2. No inflight messages
 	assert.Equal(t, 0, tracker.GetInflightCount(), "No messages should be inflight")
 
 	// 3. Verify behavior: Process more messages after commits
 	// If memory was properly cleaned, this should work fine
+	newSequences := make([]int64, 100)
 	for i := int64(0); i < 100; i++ {
 		offset := numMessages + i
-		tracker.RecordInflight(offset)
-		tracker.MarkProcessed(offset)
+		seq := tracker.AssignSequence(0, offset)
+		newSequences[i] = seq
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 	}
 
-	newCommittable := tracker.GetCommittableOffset()
-	assert.Equal(t, numMessages+99, newCommittable, "Should be able to continue processing after cleanup")
+	newCommittable := tracker.GetCommittableSequence()
+	assert.Equal(t, newSequences[99], newCommittable, "Should be able to continue processing after cleanup")
 
 	// Force GC and capture memory stats for informational purposes only
 	runtime.GC()
@@ -598,7 +627,7 @@ func TestIntegration_PropertyBasedGapDetection(t *testing.T) {
 	maxMessages := 100
 
 	for scenario := 0; scenario < numScenarios; scenario++ {
-		tracker := burrow.NewOffsetTracker(0, logger)
+		tracker := burrow.NewSequenceTracker(logger)
 		numMessages := 10 + (scenario % maxMessages) // Varying number of messages
 
 		// Record all as inflight
@@ -619,7 +648,7 @@ func TestIntegration_PropertyBasedGapDetection(t *testing.T) {
 		}
 
 		// Get committable offset
-		committable := tracker.GetCommittableOffset()
+		committable := tracker.GetCommittableSequence()
 
 		// PROPERTY: All offsets from 0 to committable must be processed (no gaps)
 		for i := int64(0); i <= committable; i++ {
@@ -643,7 +672,7 @@ func TestIntegration_PropertyBasedGapDetection(t *testing.T) {
 
 func BenchmarkGapDetection_ContiguousMessages(b *testing.B) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	// Pre-process 1000 contiguous messages
 	for i := int64(0); i < 1000; i++ {
@@ -653,13 +682,13 @@ func BenchmarkGapDetection_ContiguousMessages(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = tracker.GetCommittableOffset()
+		_ = tracker.GetCommittableSequence()
 	}
 }
 
 func BenchmarkGapDetection_WithGaps(b *testing.B) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	// Pre-process messages with gaps every 10 offsets
 	for i := int64(0); i < 1000; i++ {
@@ -673,13 +702,13 @@ func BenchmarkGapDetection_WithGaps(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = tracker.GetCommittableOffset()
+		_ = tracker.GetCommittableSequence()
 	}
 }
 
 func BenchmarkConcurrentProcessing(b *testing.B) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

@@ -9,8 +9,15 @@ import (
 // ProcessFunc is the user-defined function for processing a message
 type ProcessFunc func(context.Context, *kafka.Message) error
 
+// MessageInfo tracks partition/offset for a sequence number
+type MessageInfo struct {
+	Partition int32
+	Offset    int64
+}
+
 // Job represents a message to be processed by a worker
 type Job struct {
+	Sequence    int64 // Global sequence number for sequential tracking
 	Partition   int32
 	Offset      int64
 	Message     *kafka.Message
@@ -20,6 +27,7 @@ type Job struct {
 
 // Result represents the outcome of processing a job
 type Result struct {
+	Sequence  int64 // Global sequence number for sequential tracking
 	Partition int32
 	Offset    int64
 	Success   bool

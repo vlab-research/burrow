@@ -8,55 +8,55 @@ import (
 	"go.uber.org/zap"
 )
 
-func TestOffsetTracker_GetCommittableOffset(t *testing.T) {
+func TestSequenceTracker_GetCommittableSequence(t *testing.T) {
 	tests := []struct {
 		name      string
-		processed []int64
+		sequences []int64
 		want      int64
 	}{
 		{
 			name:      "all processed in order",
-			processed: []int64{0, 1, 2, 3, 4},
+			sequences: []int64{0, 1, 2, 3, 4},
 			want:      4,
 		},
 		{
-			name:      "gap at offset 2",
-			processed: []int64{0, 1, 3, 4, 5},
+			name:      "gap at sequence 2",
+			sequences: []int64{0, 1, 3, 4, 5},
 			want:      1, // Can only commit up to 1 (gap at 2)
 		},
 		{
 			name:      "gap at beginning",
-			processed: []int64{1, 2, 3, 4},
+			sequences: []int64{1, 2, 3, 4},
 			want:      -1, // Can't commit anything (missing 0)
 		},
 		{
 			name:      "single message",
-			processed: []int64{0},
+			sequences: []int64{0},
 			want:      0,
 		},
 		{
 			name:      "empty",
-			processed: []int64{},
+			sequences: []int64{},
 			want:      -1,
 		},
 		{
 			name:      "gap in middle",
-			processed: []int64{0, 1, 2, 4, 5, 6},
+			sequences: []int64{0, 1, 2, 4, 5, 6},
 			want:      2, // Can only commit up to 2 (gap at 3)
 		},
 		{
 			name:      "multiple gaps",
-			processed: []int64{0, 2, 4, 6, 8},
+			sequences: []int64{0, 2, 4, 6, 8},
 			want:      0, // Can only commit 0 (gap at 1)
 		},
 		{
 			name:      "large contiguous range",
-			processed: []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+			sequences: []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
 			want:      15,
 		},
 		{
 			name:      "out of order processing",
-			processed: []int64{5, 2, 0, 3, 1, 4},
+			sequences: []int64{5, 2, 0, 3, 1, 4},
 			want:      5, // All processed, should commit up to 5
 		},
 	}
@@ -64,127 +64,146 @@ func TestOffsetTracker_GetCommittableOffset(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logger, _ := zap.NewDevelopment()
-			tracker := burrow.NewOffsetTracker(0, logger)
+			tracker := burrow.NewSequenceTracker(logger)
 
-			// Mark offsets as processed
-			for _, offset := range tt.processed {
-				tracker.RecordInflight(offset)
-				tracker.MarkProcessed(offset)
+			// Assign sequences and mark as processed
+			for _, seq := range tt.sequences {
+				// Need to assign sequence first (simulating arrival)
+				// For testing, we'll manually add to maps
+				tracker.AssignSequence(0, seq) // partition 0, offset = seq for simplicity
+				tracker.RecordInflight(seq)
+				tracker.MarkProcessed(seq)
 			}
 
-			got := tracker.GetCommittableOffset()
-			assert.Equal(t, tt.want, got, "GetCommittableOffset() = %d, want %d", got, tt.want)
+			got := tracker.GetCommittableSequence()
+			assert.Equal(t, tt.want, got, "GetCommittableSequence() = %d, want %d", got, tt.want)
 		})
 	}
 }
 
-func TestOffsetTracker_MarkFailed(t *testing.T) {
+func TestSequenceTracker_MarkFailed(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
-	// Process offsets 0, 1, 2
-	tracker.RecordInflight(0)
-	tracker.MarkProcessed(0)
-	tracker.RecordInflight(1)
-	tracker.MarkProcessed(1)
-	tracker.RecordInflight(2)
-	tracker.MarkFailed(2) // Fail offset 2
+	// Process sequences 0, 1, 2
+	seq0 := tracker.AssignSequence(0, 100)
+	tracker.RecordInflight(seq0)
+	tracker.MarkProcessed(seq0)
 
-	// Process offsets 3, 4
-	tracker.RecordInflight(3)
-	tracker.MarkProcessed(3)
-	tracker.RecordInflight(4)
-	tracker.MarkProcessed(4)
+	seq1 := tracker.AssignSequence(0, 101)
+	tracker.RecordInflight(seq1)
+	tracker.MarkProcessed(seq1)
+
+	seq2 := tracker.AssignSequence(0, 102)
+	tracker.RecordInflight(seq2)
+	tracker.MarkFailed(seq2) // Fail sequence 2
+
+	// Process sequences 3, 4
+	seq3 := tracker.AssignSequence(0, 103)
+	tracker.RecordInflight(seq3)
+	tracker.MarkProcessed(seq3)
+
+	seq4 := tracker.AssignSequence(0, 104)
+	tracker.RecordInflight(seq4)
+	tracker.MarkProcessed(seq4)
 
 	// Should only be able to commit up to 1 (gap at 2)
-	committable := tracker.GetCommittableOffset()
-	assert.Equal(t, int64(1), committable, "Expected committable offset 1 due to failure at 2")
+	committable := tracker.GetCommittableSequence()
+	assert.Equal(t, int64(1), committable, "Expected committable sequence 1 due to failure at 2")
 }
 
-func TestOffsetTracker_CommitOffset(t *testing.T) {
+func TestSequenceTracker_CommitSequence(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
-	// Process offsets 0-9
+	// Process sequences 0-9
 	for i := int64(0); i < 10; i++ {
-		tracker.RecordInflight(i)
-		tracker.MarkProcessed(i)
+		seq := tracker.AssignSequence(0, 100+i)
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 	}
 
-	// Commit offset 5
-	tracker.CommitOffset(5)
+	// Commit sequence 5
+	tracker.CommitSequence(5)
 	assert.Equal(t, int64(5), tracker.GetLastCommitted())
 
 	// After commit, should be able to continue from 6
-	committable := tracker.GetCommittableOffset()
+	committable := tracker.GetCommittableSequence()
 	assert.Equal(t, int64(9), committable, "Should be able to commit up to 9")
 }
 
-func TestOffsetTracker_GetInflightCount(t *testing.T) {
+func TestSequenceTracker_GetInflightCount(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	// No inflight initially
 	assert.Equal(t, 0, tracker.GetInflightCount())
 
-	// Mark 3 offsets as inflight
-	tracker.RecordInflight(0)
-	tracker.RecordInflight(1)
-	tracker.RecordInflight(2)
+	// Assign and mark 3 sequences as inflight
+	seq0 := tracker.AssignSequence(0, 100)
+	tracker.RecordInflight(seq0)
+
+	seq1 := tracker.AssignSequence(0, 101)
+	tracker.RecordInflight(seq1)
+
+	seq2 := tracker.AssignSequence(0, 102)
+	tracker.RecordInflight(seq2)
+
 	assert.Equal(t, 3, tracker.GetInflightCount())
 
 	// Complete one
-	tracker.MarkProcessed(1)
+	tracker.MarkProcessed(seq1)
 	assert.Equal(t, 2, tracker.GetInflightCount())
 
 	// Fail one
-	tracker.MarkFailed(2)
+	tracker.MarkFailed(seq2)
 	assert.Equal(t, 1, tracker.GetInflightCount())
 
 	// Complete last one
-	tracker.MarkProcessed(0)
+	tracker.MarkProcessed(seq0)
 	assert.Equal(t, 0, tracker.GetInflightCount())
 }
 
-func TestOffsetTracker_MemoryLeak(t *testing.T) {
+func TestSequenceTracker_MemoryLeak(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
-	// Process many offsets
+	// Process many sequences
 	for i := int64(0); i < 1000; i++ {
-		tracker.RecordInflight(i)
-		tracker.MarkProcessed(i)
+		seq := tracker.AssignSequence(0, 100+i)
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 	}
 
 	// Commit up to 990
-	tracker.CommitOffset(990)
+	tracker.CommitSequence(990)
 
 	// Now process more
 	for i := int64(1000); i < 2000; i++ {
-		tracker.RecordInflight(i)
-		tracker.MarkProcessed(i)
+		seq := tracker.AssignSequence(0, 100+i)
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 	}
 
-	committable := tracker.GetCommittableOffset()
+	committable := tracker.GetCommittableSequence()
 	assert.Equal(t, int64(1999), committable)
 }
 
-func TestOffsetTracker_ConcurrentAccess(t *testing.T) {
+func TestSequenceTracker_ConcurrentAccess(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	// Simulate concurrent processing
 	done := make(chan bool)
 	numGoroutines := 10
-	offsetsPerGoroutine := 100
+	sequencesPerGoroutine := 100
 
 	for g := 0; g < numGoroutines; g++ {
 		go func(goroutineID int) {
-			startOffset := int64(goroutineID * offsetsPerGoroutine)
-			for i := int64(0); i < int64(offsetsPerGoroutine); i++ {
-				offset := startOffset + i
-				tracker.RecordInflight(offset)
-				tracker.MarkProcessed(offset)
+			for i := 0; i < sequencesPerGoroutine; i++ {
+				seq := tracker.AssignSequence(0, int64(goroutineID*1000+i))
+				tracker.RecordInflight(seq)
+				tracker.MarkProcessed(seq)
 			}
 			done <- true
 		}(g)
@@ -195,99 +214,158 @@ func TestOffsetTracker_ConcurrentAccess(t *testing.T) {
 		<-done
 	}
 
-	// All offsets should be processed
-	committable := tracker.GetCommittableOffset()
-	expectedMax := int64(numGoroutines*offsetsPerGoroutine - 1)
+	// All sequences should be processed
+	committable := tracker.GetCommittableSequence()
+	expectedMax := int64(numGoroutines*sequencesPerGoroutine - 1)
 	assert.Equal(t, expectedMax, committable)
 }
 
-func TestOffsetTracker_GapAfterCommit(t *testing.T) {
+func TestSequenceTracker_GapAfterCommit(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
 	// Process and commit 0-4
 	for i := int64(0); i < 5; i++ {
-		tracker.RecordInflight(i)
-		tracker.MarkProcessed(i)
+		seq := tracker.AssignSequence(0, 100+i)
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 	}
-	tracker.CommitOffset(4)
+	tracker.CommitSequence(4)
 
 	// Now process 5, skip 6, process 7-9
-	tracker.RecordInflight(5)
-	tracker.MarkProcessed(5)
-	tracker.RecordInflight(6)
-	tracker.MarkFailed(6) // Create gap
+	seq5 := tracker.AssignSequence(0, 105)
+	tracker.RecordInflight(seq5)
+	tracker.MarkProcessed(seq5)
+
+	seq6 := tracker.AssignSequence(0, 106)
+	tracker.RecordInflight(seq6)
+	tracker.MarkFailed(seq6) // Create gap
+
 	for i := int64(7); i < 10; i++ {
-		tracker.RecordInflight(i)
-		tracker.MarkProcessed(i)
+		seq := tracker.AssignSequence(0, 100+i)
+		tracker.RecordInflight(seq)
+		tracker.MarkProcessed(seq)
 	}
 
 	// Should only be able to commit up to 5
-	committable := tracker.GetCommittableOffset()
-	assert.Equal(t, int64(5), committable, "Should stop at gap at offset 6")
+	committable := tracker.GetCommittableSequence()
+	assert.Equal(t, int64(5), committable, "Should stop at gap at sequence 6")
 }
 
-func TestOffsetTracker_HighWatermark(t *testing.T) {
+func TestSequenceTracker_GetCommittableOffsets(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	tracker := burrow.NewOffsetTracker(0, logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
-	// Record offsets out of order
-	tracker.RecordInflight(5)
-	tracker.RecordInflight(2)
-	tracker.RecordInflight(8)
-	tracker.RecordInflight(1)
+	// Interleave messages from two partitions
+	seq0 := tracker.AssignSequence(0, 100) // P0-O100
+	seq1 := tracker.AssignSequence(1, 200) // P1-O200
+	seq2 := tracker.AssignSequence(0, 101) // P0-O101
+	seq3 := tracker.AssignSequence(1, 201) // P1-O201
 
-	// Mark some as processed (but with gaps)
-	tracker.MarkProcessed(1)
-	tracker.MarkProcessed(2)
-	tracker.MarkProcessed(5)
-	tracker.MarkProcessed(8)
+	// Mark all as processed
+	tracker.MarkProcessed(seq0)
+	tracker.MarkProcessed(seq1)
+	tracker.MarkProcessed(seq2)
+	tracker.MarkProcessed(seq3)
 
-	// Should not be able to commit anything (missing 0)
-	committable := tracker.GetCommittableOffset()
-	assert.Equal(t, int64(-1), committable, "Should not commit with gap at beginning")
+	// Get committable offsets
+	offsets := tracker.GetCommittableOffsets()
+
+	// Should return highest offset per partition
+	assert.Equal(t, int64(101), offsets[0], "Partition 0 should commit up to 101")
+	assert.Equal(t, int64(201), offsets[1], "Partition 1 should commit up to 201")
 }
 
-func TestOffsetTracker_EdgeCases(t *testing.T) {
-	t.Run("negative offsets not supported", func(t *testing.T) {
+func TestSequenceTracker_MultiPartitionBlocking(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	tracker := burrow.NewSequenceTracker(logger)
+
+	// Interleaved partitions
+	seq0 := tracker.AssignSequence(0, 100) // P0-O100
+	seq1 := tracker.AssignSequence(1, 200) // P1-O200
+	seq2 := tracker.AssignSequence(0, 101) // P0-O101
+	seq3 := tracker.AssignSequence(1, 201) // P1-O201 (will fail)
+
+	tracker.MarkProcessed(seq0)
+	tracker.MarkProcessed(seq1)
+	tracker.MarkProcessed(seq2)
+	tracker.MarkFailed(seq3) // Gap at seq3
+
+	offsets := tracker.GetCommittableOffsets()
+
+	// Gap at seq3 blocks seq2
+	// So committable seq is 2, which includes:
+	//   seq0 → (P0, 100)
+	//   seq1 → (P1, 200)
+	//   seq2 → (P0, 101)
+
+	assert.Equal(t, int64(101), offsets[0], "P0 should commit up to 101")
+	assert.Equal(t, int64(200), offsets[1], "P1 should commit up to 200 (blocked by seq3)")
+}
+
+func TestSequenceTracker_SequenceMonotonicity(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	tracker := burrow.NewSequenceTracker(logger)
+
+	// Sequences should be monotonically increasing
+	seq0 := tracker.AssignSequence(0, 100)
+	seq1 := tracker.AssignSequence(0, 101)
+	seq2 := tracker.AssignSequence(1, 200)
+	seq3 := tracker.AssignSequence(1, 201)
+
+	assert.Equal(t, int64(0), seq0)
+	assert.Equal(t, int64(1), seq1)
+	assert.Equal(t, int64(2), seq2)
+	assert.Equal(t, int64(3), seq3)
+}
+
+func TestSequenceTracker_EdgeCases(t *testing.T) {
+	t.Run("no sequences assigned", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		tracker := burrow.NewOffsetTracker(0, logger)
+		tracker := burrow.NewSequenceTracker(logger)
 
-		// Process starting from 0
-		tracker.RecordInflight(0)
-		tracker.MarkProcessed(0)
-
-		committable := tracker.GetCommittableOffset()
-		assert.Equal(t, int64(0), committable)
-	})
-
-	t.Run("very large offsets", func(t *testing.T) {
-		logger, _ := zap.NewDevelopment()
-		tracker := burrow.NewOffsetTracker(0, logger)
-
-		largeOffset := int64(1000000)
-		tracker.RecordInflight(largeOffset)
-		tracker.MarkProcessed(largeOffset)
-
-		// Can't commit because there's a gap from -1 to 1000000
-		committable := tracker.GetCommittableOffset()
+		committable := tracker.GetCommittableSequence()
 		assert.Equal(t, int64(-1), committable)
+
+		offsets := tracker.GetCommittableOffsets()
+		assert.Equal(t, 0, len(offsets))
 	})
 
 	t.Run("duplicate processing", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		tracker := burrow.NewOffsetTracker(0, logger)
+		tracker := burrow.NewSequenceTracker(logger)
 
-		// Process same offset twice
-		tracker.RecordInflight(0)
-		tracker.RecordInflight(0) // Duplicate
-		tracker.MarkProcessed(0)
-		tracker.MarkProcessed(0) // Duplicate
+		// Process same sequence twice
+		seq0 := tracker.AssignSequence(0, 100)
+		tracker.RecordInflight(seq0)
+		tracker.RecordInflight(seq0) // Duplicate
+		tracker.MarkProcessed(seq0)
+		tracker.MarkProcessed(seq0) // Duplicate
 
-		tracker.RecordInflight(1)
-		tracker.MarkProcessed(1)
+		seq1 := tracker.AssignSequence(0, 101)
+		tracker.RecordInflight(seq1)
+		tracker.MarkProcessed(seq1)
 
-		committable := tracker.GetCommittableOffset()
+		committable := tracker.GetCommittableSequence()
 		assert.Equal(t, int64(1), committable)
+	})
+
+	t.Run("out of order commit", func(t *testing.T) {
+		logger, _ := zap.NewDevelopment()
+		tracker := burrow.NewSequenceTracker(logger)
+
+		// Process sequences
+		for i := int64(0); i < 10; i++ {
+			seq := tracker.AssignSequence(0, 100+i)
+			tracker.RecordInflight(seq)
+			tracker.MarkProcessed(seq)
+		}
+
+		// Commit sequence 5
+		tracker.CommitSequence(5)
+
+		// Should be able to get offsets for remaining
+		offsets := tracker.GetCommittableOffsets()
+		assert.Equal(t, int64(109), offsets[0], "Should commit up to offset 109")
 	})
 }

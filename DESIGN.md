@@ -21,20 +21,25 @@ Can commit: offset 0 only      ← Must wait for 1,2,3 in sequence
 
 If you commit offset 5 but offset 3 failed, **you lose message 3 forever** on restart.
 
-## The Solution: Ordered Offset Tracking
+## The Solution: Sequential Tracking
 
 Burrow solves this with three key mechanisms:
 
 1. **Concurrent processing** - N workers process messages in parallel
-2. **Gap detection** - Track which offsets are complete, find gaps in the sequence
-3. **Ordered commits** - Only commit offsets where all prior offsets are complete
+2. **Sequential tracking** - Assign sequence numbers as messages arrive, track completion
+3. **Gap detection** - Find gaps in sequence, only commit messages up to first gap
+4. **Ordered commits** - Convert sequences to per-partition offsets for Kafka
 
 This ensures **at-least-once delivery** while achieving high throughput.
+
+**Key Insight:** Track the order WE receive messages (sequence numbers), not per-partition offsets. Simpler architecture, same guarantees.
 
 ## Architecture
 
 ```
 Kafka Consumer (single-threaded)
+     ↓
+Sequence Assignment (atomic counter)
      ↓
 Message Dispatcher
      ↓
@@ -42,9 +47,9 @@ Worker Pool (N goroutines)      ← Concurrent processing
      ↓
 Result Processor
      ↓
-Offset Tracker (per partition)  ← Gap detection
+Sequence Tracker (single)       ← Gap detection on sequences
      ↓
-Commit Manager                  ← Ordered commits
+Commit Manager                  ← Convert sequences → partition offsets
 ```
 
 ### Core Components
@@ -64,12 +69,20 @@ Fixed pool of goroutines that:
 - Send results back to pool
 - Provide backpressure through bounded channels
 
-#### 3. Offset Tracker (per partition)
-Tracks completion state for each partition:
-- Maintains map of processed offsets: `map[int64]bool`
-- Detects gaps in offset sequence
-- Computes highest committable offset (no gaps before it)
+#### 3. Sequence Tracker (single, simplified!)
+Tracks completion state across all partitions:
+- Assigns monotonic sequence numbers (atomic counter)
+- Stores `MessageInfo{partition, offset}` for each sequence
+- Detects gaps in sequence numbers (not offsets!)
+- Computes highest committable sequence (no gaps before it)
+- Converts sequences to per-partition offsets for Kafka commit
 - Cleans up old entries after commit
+
+**Why simpler than per-partition tracking?**
+- Single tracker vs map of trackers
+- No per-partition mutex coordination
+- Simpler rebalance (wait for all inflight, not per-partition)
+- ~200 lines of code removed!
 
 #### 4. Commit Manager
 Coordinates offset commits:
@@ -85,12 +98,17 @@ Prevents cascading failures:
 - Resets on successful processing
 - Inspired by Eddies pattern
 
-## Key Algorithm: Gap Detection
+## Key Algorithm: Sequential Gap Detection
 
-The core innovation is finding the highest offset that can be safely committed:
+The core innovation is tracking by **sequence** instead of per-partition offsets:
 
 ```go
-func FindCommittableOffset(
+// 1. Assign sequence as messages arrive (any partition)
+sequence := atomic.AddInt64(&sequenceCounter, 1)
+tracker.AssignSequence(partition, offset) // stores MessageInfo
+
+// 2. Find highest committable sequence
+func GetCommittableSequence(
     processed map[int64]bool,
     lastCommitted int64,
     highWatermark int64,
@@ -98,27 +116,87 @@ func FindCommittableOffset(
     committable := lastCommitted
 
     // Scan from last committed + 1 up to high watermark
-    for offset := lastCommitted + 1; offset <= highWatermark; offset++ {
-        if !processed[offset] {
+    for seq := lastCommitted + 1; seq <= highWatermark; seq++ {
+        if !processed[seq] {
             break  // Gap found! Can't commit beyond this
         }
-        committable = offset
+        committable = seq
     }
 
     return committable
 }
+
+// 3. Convert sequences to Kafka offsets
+func GetCommittableOffsets() map[int32]int64 {
+    committable := GetCommittableSequence()
+    offsets := make(map[int32]int64)
+
+    // For each sequence up to committable, track highest offset per partition
+    for seq := lastCommitted + 1; seq <= committable; seq++ {
+        info := messageInfo[seq]
+        if info.Offset > offsets[info.Partition] {
+            offsets[info.Partition] = info.Offset
+        }
+    }
+    return offsets
+}
 ```
 
-**Example:**
+**Example with Multiple Partitions:**
 ```
-Last committed: 10
-Processed: {11: true, 12: true, 13: false, 14: true, 15: true}
-Committable: 12  (stop at gap at offset 13)
+Received: [p0:100, p0:101, p1:50, p0:102, p1:51]
+Sequences: [0,      1,      2,     3,      4]
+Processed: {0: true, 1: true, 2: false, 3: true, 4: true}
+
+Committable sequence: 1  (gap at seq 2)
+Convert to offsets:
+  - p0: 101 (from sequences 0,1)
+  - p1: nothing (seq 2 which is p1:50 failed)
 ```
+
+**Key insight:** Gap in p1 blocks commits for p0 too, but that's OK! Simplicity wins.
 
 This is a **pure function** - no state, no I/O, no mutexes - making it trivially testable.
 
 ## Design Decisions
+
+### 0. Sequential Tracking Over Per-Partition (Major Simplification!)
+
+**Decision:** Track messages by arrival order (sequence numbers) instead of per-partition offsets
+
+**Rationale:**
+- **Massive simplification**: Single tracker vs map of trackers (~200 lines removed)
+- **Real-world usage**: Most deployments have 1-2 partitions per consumer
+- **Acceptable trade-off**: Gap in one partition blocks all, but simplicity wins
+
+**Before (Complex):**
+```go
+Pool {
+    offsetTrackers: map[int32]*OffsetTracker  // One per partition
+    trackersMu:     sync.RWMutex               // Coordinate access
+}
+
+// Complex partition management
+getOrCreateTracker(partition)
+onPartitionsRevoked() // Per-partition cleanup
+```
+
+**After (Simple):**
+```go
+Pool {
+    sequenceTracker: *SequenceTracker  // Single tracker!
+}
+
+// Simple: just wait for all inflight
+WaitForInflight(ctx, timeout)
+```
+
+**Why This Works:**
+1. **Single partition** (common): No blocking issue
+2. **Multiple partitions, single consumer**: Blocking exists but rare
+3. **Multiple partitions, multiple consumers**: Each gets 1-2 partitions
+
+**Trade-off Accepted:** Gap in partition 1 blocks partition 0 commits. This is acceptable because per-partition independence is rarely exercised in practice.
 
 ### 1. Pure Functional Core
 

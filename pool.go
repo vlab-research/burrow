@@ -14,18 +14,17 @@ import (
 
 // Pool is the main entry point for Burrow
 type Pool struct {
-	consumer       *kafka.Consumer
-	config         Config
-	workerPool     *WorkerPool
-	commitManager  *CommitManager
-	errorTracker   *ErrorTracker
-	offsetTrackers map[int32]*OffsetTracker
-	trackersMu     sync.RWMutex
-	logger         *zap.Logger
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	rebalanceCb    kafka.RebalanceCb
+	consumer        *kafka.Consumer
+	config          Config
+	workerPool      *WorkerPool
+	commitManager   *CommitManager
+	errorTracker    *ErrorTracker
+	sequenceTracker *SequenceTracker // Single tracker for all partitions
+	logger          *zap.Logger
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	rebalanceCb     kafka.RebalanceCb
 
 	// Statistics (atomic counters)
 	statsMessagesProcessed int64
@@ -56,20 +55,24 @@ func NewPool(consumer *kafka.Consumer, config Config) (*Pool, error) {
 		config.Logger,
 	)
 
+	// Create sequence tracker
+	sequenceTracker := NewSequenceTracker(config.Logger)
+
 	pool := &Pool{
-		consumer:       consumer,
-		config:         config,
-		workerPool:     workerPool,
-		errorTracker:   errorTracker,
-		offsetTrackers: make(map[int32]*OffsetTracker),
-		logger:         config.Logger,
-		ctx:            ctx,
-		cancel:         cancel,
+		consumer:        consumer,
+		config:          config,
+		workerPool:      workerPool,
+		errorTracker:    errorTracker,
+		sequenceTracker: sequenceTracker,
+		logger:          config.Logger,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
-	// Create commit manager with stats counter
+	// Create commit manager with sequence tracker
 	commitManager := NewCommitManager(
 		consumer,
+		sequenceTracker,
 		config.CommitInterval,
 		config.CommitBatchSize,
 		config.Logger,
@@ -138,8 +141,15 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 				continue
 			}
 
+			// Assign sequence number
+			sequence := p.sequenceTracker.AssignSequence(
+				msg.TopicPartition.Partition,
+				int64(msg.TopicPartition.Offset),
+			)
+
 			// Create job
 			job := &Job{
+				Sequence:    sequence,
 				Partition:   msg.TopicPartition.Partition,
 				Offset:      int64(msg.TopicPartition.Offset),
 				Message:     msg,
@@ -147,11 +157,8 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 				Attempt:     0,
 			}
 
-			// Get or create tracker for this partition
-			tracker := p.getOrCreateTracker(job.Partition)
-
-			// Record inflight
-			tracker.RecordInflight(job.Offset)
+			// Record inflight with sequence
+			p.sequenceTracker.RecordInflight(sequence)
 
 			// Submit to worker pool (blocks if queue is full - backpressure!)
 			if err := p.workerPool.SubmitJob(ctx, job); err != nil {
@@ -167,37 +174,33 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 // processResults handles results from workers
 func (p *Pool) processResults() {
 	for result := range p.workerPool.Results() {
-		tracker := p.getTracker(result.Partition)
-		if tracker == nil {
-			p.logger.Warn("no tracker for partition", zap.Int32("partition", result.Partition))
-			continue
-		}
-
 		if result.Success {
 			// Success!
-			tracker.MarkProcessed(result.Offset)
+			p.sequenceTracker.MarkProcessed(result.Sequence)
 			p.errorTracker.RecordSuccess()
 			atomic.AddInt64(&p.statsMessagesProcessed, 1)
 
 			p.logger.Debug("message processed successfully",
+				zap.Int64("sequence", result.Sequence),
 				zap.Int32("partition", result.Partition),
 				zap.Int64("offset", result.Offset))
 
 		} else {
 			// Failure - handle retry or permanent failure
-			p.handleFailure(result, tracker)
+			p.handleFailure(result)
 		}
 	}
 }
 
 // handleFailure handles a failed message (retry or permanent failure)
-func (p *Pool) handleFailure(result *Result, tracker *OffsetTracker) {
+func (p *Pool) handleFailure(result *Result) {
 	// Check if retriable
 	if result.Attempt < p.config.MaxRetries && isRetriable(result.Error) {
 		// Retry with backoff
 		backoff := calculateBackoff(result.Attempt, p.config.RetryBackoffBase)
 
 		p.logger.Info("retrying message",
+			zap.Int64("sequence", result.Sequence),
 			zap.Int32("partition", result.Partition),
 			zap.Int64("offset", result.Offset),
 			zap.Int("attempt", result.Attempt+1),
@@ -206,7 +209,9 @@ func (p *Pool) handleFailure(result *Result, tracker *OffsetTracker) {
 			zap.Error(result.Error))
 
 		// Schedule retry with proper context handling
+		// IMPORTANT: Keep the same sequence number for retry
 		retryJob := &Job{
+			Sequence:    result.Sequence,
 			Partition:   result.Partition,
 			Offset:      result.Offset,
 			Message:     result.Job.Message,
@@ -222,27 +227,30 @@ func (p *Pool) handleFailure(result *Result, tracker *OffsetTracker) {
 				if err := p.workerPool.SubmitJob(p.ctx, job); err != nil {
 					// Context cancelled or other error - mark as failed
 					p.logger.Warn("failed to submit retry job",
+						zap.Int64("sequence", job.Sequence),
 						zap.Int32("partition", job.Partition),
 						zap.Int64("offset", job.Offset),
 						zap.Error(err))
-					tracker.MarkFailed(job.Offset)
+					p.sequenceTracker.MarkFailed(job.Sequence)
 				}
 			case <-p.ctx.Done():
 				// Context cancelled - mark as failed
 				p.logger.Debug("retry cancelled due to context",
+					zap.Int64("sequence", job.Sequence),
 					zap.Int32("partition", job.Partition),
 					zap.Int64("offset", job.Offset))
-				tracker.MarkFailed(job.Offset)
+				p.sequenceTracker.MarkFailed(job.Sequence)
 				return
 			}
 		}(retryJob)
 
 	} else {
 		// Permanent failure - mark as failed (leaves gap)
-		tracker.MarkFailed(result.Offset)
+		p.sequenceTracker.MarkFailed(result.Sequence)
 		atomic.AddInt64(&p.statsMessagesFailed, 1)
 
 		p.logger.Error("permanent message failure",
+			zap.Int64("sequence", result.Sequence),
 			zap.Int32("partition", result.Partition),
 			zap.Int64("offset", result.Offset),
 			zap.Int("attempts", result.Attempt+1),
@@ -257,28 +265,6 @@ func (p *Pool) handleFailure(result *Result, tracker *OffsetTracker) {
 	}
 }
 
-// getOrCreateTracker gets or creates a tracker for a partition
-func (p *Pool) getOrCreateTracker(partition int32) *OffsetTracker {
-	p.trackersMu.Lock()
-	defer p.trackersMu.Unlock()
-
-	if tracker, exists := p.offsetTrackers[partition]; exists {
-		return tracker
-	}
-
-	tracker := NewOffsetTracker(partition, p.logger)
-	p.offsetTrackers[partition] = tracker
-	p.commitManager.RegisterTracker(partition, tracker)
-	p.logger.Info("created tracker for partition", zap.Int32("partition", partition))
-	return tracker
-}
-
-// getTracker gets a tracker for a partition (may return nil)
-func (p *Pool) getTracker(partition int32) *OffsetTracker {
-	p.trackersMu.RLock()
-	defer p.trackersMu.RUnlock()
-	return p.offsetTrackers[partition]
-}
 
 // setupRebalanceCallback configures partition rebalance handling
 func (p *Pool) setupRebalanceCallback() {
@@ -302,7 +288,7 @@ func (p *Pool) onPartitionsAssigned(partitions []kafka.TopicPartition) {
 		zap.Int("count", len(partitions)),
 		zap.Any("partitions", partitions))
 
-	// Trackers will be created lazily when first message arrives
+	// Sequence tracker is global - no per-partition setup needed
 }
 
 // onPartitionsRevoked handles partition revocation
@@ -311,34 +297,21 @@ func (p *Pool) onPartitionsRevoked(partitions []kafka.TopicPartition) {
 		zap.Int("count", len(partitions)),
 		zap.Any("partitions", partitions))
 
-	// Wait for inflight messages to complete
-	for _, tp := range partitions {
-		tracker := p.getTracker(tp.Partition)
-		if tracker != nil {
-			p.logger.Info("waiting for inflight messages",
-				zap.Int32("partition", tp.Partition),
-				zap.Int("inflight", tracker.GetInflightCount()))
+	// Wait for ALL inflight messages to complete (simplified from per-partition wait)
+	inflight := p.sequenceTracker.GetInflightCount()
+	if inflight > 0 {
+		p.logger.Info("waiting for inflight messages",
+			zap.Int("inflight", inflight))
 
-			// Wait up to 30 seconds for inflight to complete
-			if err := tracker.WaitForInflight(p.ctx, 30*time.Second); err != nil {
-				p.logger.Error("failed to wait for inflight messages",
-					zap.Int32("partition", tp.Partition),
-					zap.Error(err))
-				// Continue anyway - we tried our best
-			}
+		// Wait up to 30 seconds for all inflight to complete
+		if err := p.sequenceTracker.WaitForInflight(p.ctx, 30*time.Second); err != nil {
+			p.logger.Error("failed to wait for inflight messages", zap.Error(err))
+			// Continue anyway - we tried our best
 		}
 	}
 
-	// Final commit before losing partition
+	// Final commit before losing partitions
 	p.commitManager.tryCommit(p.ctx)
-
-	// Cleanup trackers
-	p.trackersMu.Lock()
-	for _, tp := range partitions {
-		delete(p.offsetTrackers, tp.Partition)
-		p.commitManager.UnregisterTracker(tp.Partition)
-	}
-	p.trackersMu.Unlock()
 
 	p.logger.Info("partitions cleanup complete",
 		zap.Int("count", len(partitions)))
@@ -346,22 +319,11 @@ func (p *Pool) onPartitionsRevoked(partitions []kafka.TopicPartition) {
 
 // GetStats returns runtime statistics
 func (p *Pool) GetStats() Stats {
-	p.trackersMu.RLock()
-	jobsQueued := 0
-	workersActive := 0
-	for _, tracker := range p.offsetTrackers {
-		jobsQueued += tracker.GetInflightCount()
-	}
-	p.trackersMu.RUnlock()
-
-	// Get worker stats from worker pool
-	workersActive = p.config.NumWorkers // Active workers (simplified - all workers are always active)
-
 	return Stats{
 		MessagesProcessed: atomic.LoadInt64(&p.statsMessagesProcessed),
 		MessagesFailed:    atomic.LoadInt64(&p.statsMessagesFailed),
 		OffsetsCommitted:  atomic.LoadInt64(&p.statsOffsetsCommitted),
-		WorkersActive:     workersActive,
-		JobsQueued:        jobsQueued,
+		WorkersActive:     p.config.NumWorkers,
+		JobsQueued:        p.sequenceTracker.GetInflightCount(),
 	}
 }
