@@ -47,26 +47,26 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 
 	// Create result
 	result := &Result{
+		Sequence:  job.Sequence,
 		Partition: job.Partition,
 		Offset:    job.Offset,
 		Success:   err == nil,
 		Error:     err,
-		Attempt:   job.Attempt,
-		Job:       job,
 	}
 
 	// Log result
 	if err != nil {
 		w.logger.Error("job failed",
 			zap.Int("worker_id", w.id),
+			zap.Int64("sequence", job.Sequence),
 			zap.Int32("partition", job.Partition),
 			zap.Int64("offset", job.Offset),
-			zap.Int("attempt", job.Attempt),
 			zap.Duration("duration", duration),
 			zap.Error(err))
 	} else {
 		w.logger.Debug("job succeeded",
 			zap.Int("worker_id", w.id),
+			zap.Int64("sequence", job.Sequence),
 			zap.Int32("partition", job.Partition),
 			zap.Int64("offset", job.Offset),
 			zap.Duration("duration", duration))

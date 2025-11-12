@@ -134,24 +134,22 @@ Default values:
 - `ResultQueueSize`: 1000
 - `CommitInterval`: 5 seconds
 - `CommitBatchSize`: 1000 messages
-- `MaxConsecutiveErrors`: 5
-- `MaxRetries`: 3
-- `RetryBackoffBase`: 1 second
+- `OnError`: FatalOnError (fast failure)
+- `ShutdownTimeout`: 30 seconds
 
 ### Custom Configuration
 
 ```go
 config := burrow.Config{
-    NumWorkers:           100,             // 100 concurrent workers
-    JobQueueSize:         10000,           // Larger buffer
-    ResultQueueSize:      10000,
-    CommitInterval:       10 * time.Second, // Commit every 10s
-    CommitBatchSize:      5000,            // Or every 5000 messages
-    MaxConsecutiveErrors: 10,              // Tolerate more errors
-    MaxRetries:           5,               // More retries
-    RetryBackoffBase:     2 * time.Second, // Slower backoff
-    Logger:               logger,
-    EnableMetrics:        true,
+    NumWorkers:      100,               // 100 concurrent workers
+    JobQueueSize:    10000,             // Larger buffer
+    ResultQueueSize: 10000,
+    CommitInterval:  10 * time.Second,  // Commit every 10s
+    CommitBatchSize: 5000,              // Or every 5000 messages
+    OnError:         burrow.FreezeOnError, // Use freeze mode for debugging
+    ShutdownTimeout: 60 * time.Second,  // Wait longer for inflight
+    Logger:          logger,
+    EnableMetrics:   true,
 }
 
 pool, err := burrow.NewPool(consumer, config)
@@ -199,36 +197,61 @@ Alert when:
 
 ## Error Handling
 
-### Retriable vs. Permanent Errors
+### Error Behavior
+
+When your `processFunc` returns an error, it signals something is **seriously wrong** (database down, critical service unavailable, etc.). Burrow provides two behaviors:
+
+**FatalOnError (Default) - Fast Failure:**
+```go
+config.OnError = burrow.FatalOnError
+```
+- Immediately exits process (`os.Exit(1)`) on first error
+- No graceful shutdown, no waiting for inflight messages
+- Container runtime restarts with crash loop backoff
+- **Best for production** with auto-restart (Kubernetes, systemd)
+
+**FreezeOnError - Debug Mode:**
+```go
+config.OnError = burrow.FreezeOnError
+```
+- Stops polling new messages
+- Waits for inflight messages to complete
+- Commits offsets up to the failed message
+- Freezes forever (requires manual restart)
+- **Best for investigation** - preserves state for debugging
+
+### Retry Logic
+
+**Burrow does NOT handle retries.** Your app should handle retries in `processFunc`:
 
 ```go
 processFunc := func(ctx context.Context, msg *kafka.Message) error {
-    result, err := callExternalAPI(msg)
-    if err != nil {
-        // Network errors are retriable (automatic retry)
-        if isNetworkError(err) {
-            return err  // Burrow will retry with backoff
+    // App handles retries
+    for attempt := 0; attempt < 3; attempt++ {
+        err := doWork(msg)
+        if err == nil {
+            return nil  // Success
         }
 
-        // Business logic errors are permanent (no retry)
-        return fmt.Errorf("permanent error: %w", err)
+        // App decides what's retriable
+        if !isRetriable(err) {
+            sendToDLQ(msg, err)
+            return nil  // Handled, don't error
+        }
+
+        // App controls backoff
+        time.Sleep(time.Duration(1<<attempt) * time.Second)
     }
 
-    return saveToDatabase(result)
+    // Exhausted retries
+    sendToDLQ(msg, err)
+    return nil  // We handled it
 }
 ```
 
-Burrow automatically retries failed messages with exponential backoff (1s, 2s, 4s, 8s, ..., max 60s).
+**Return `error` only when something is seriously wrong** (requires restart).
 
-### Error Threshold
-
-If `MaxConsecutiveErrors` is exceeded, Burrow halts processing to prevent cascading failures:
-
-```go
-config.MaxConsecutiveErrors = 5  // Halt after 5 consecutive errors
-```
-
-Successful processing resets the counter.
+**Return `nil` when you've handled the message** (even if processing "failed" - e.g., sent to DLQ).
 
 ## Graceful Shutdown
 

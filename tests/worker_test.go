@@ -35,11 +35,11 @@ func TestWorkerPool_BasicJobProcessing(t *testing.T) {
 	numJobs := 10
 	for i := 0; i < numJobs; i++ {
 		job := &burrow.Job{
+			Sequence:    int64(i),
 			Partition:   0,
 			Offset:      int64(i),
 			Message:     &kafka.Message{Value: []byte("test")},
 			ProcessFunc: processFunc,
-			Attempt:     0,
 		}
 		err := wp.SubmitJob(ctx, job)
 		assert.NoError(t, err)
@@ -93,11 +93,11 @@ func TestWorkerPool_ConcurrentProcessing(t *testing.T) {
 	numJobs := 50
 	for i := 0; i < numJobs; i++ {
 		job := &burrow.Job{
+			Sequence:    int64(i),
 			Partition:   0,
 			Offset:      int64(i),
 			Message:     &kafka.Message{Value: []byte("test")},
 			ProcessFunc: processFunc,
-			Attempt:     0,
 		}
 		err := wp.SubmitJob(ctx, job)
 		assert.NoError(t, err)
@@ -131,11 +131,11 @@ func TestWorkerPool_ErrorHandling(t *testing.T) {
 
 	// Submit failing job
 	job := &burrow.Job{
+		Sequence:    0,
 		Partition:   0,
 		Offset:      0,
 		Message:     &kafka.Message{Value: []byte("test")},
 		ProcessFunc: processFunc,
-		Attempt:     0,
 	}
 	err := wp.SubmitJob(ctx, job)
 	assert.NoError(t, err)
@@ -184,7 +184,6 @@ func TestWorkerPool_ContextCancellation(t *testing.T) {
 			Offset:      int64(i),
 			Message:     &kafka.Message{Value: []byte("test")},
 			ProcessFunc: processFunc,
-			Attempt:     0,
 		}
 		wp.SubmitJob(ctx, job)
 	}
@@ -202,7 +201,6 @@ func TestWorkerPool_ContextCancellation(t *testing.T) {
 		Offset:      999,
 		Message:     &kafka.Message{Value: []byte("test")},
 		ProcessFunc: processFunc,
-		Attempt:     0,
 	}
 	err := wp.SubmitJob(ctx, job)
 	assert.Error(t, err, "Expected error when submitting to cancelled context")
@@ -238,7 +236,6 @@ func TestWorkerPool_JobOrdering(t *testing.T) {
 			Offset:      offset,
 			Message:     &kafka.Message{Value: []byte{byte(offset)}},
 			ProcessFunc: processFunc,
-			Attempt:     0,
 		}
 		err := wp.SubmitJob(ctx, job)
 		assert.NoError(t, err)
@@ -290,7 +287,6 @@ func TestWorkerPool_Backpressure(t *testing.T) {
 				Offset:      int64(idx),
 				Message:     &kafka.Message{Value: []byte("test")},
 				ProcessFunc: processFunc,
-				Attempt:     0,
 			}
 			err := wp.SubmitJob(ctx, job)
 			if err == nil {
@@ -348,7 +344,6 @@ func TestWorkerPool_MultiplePartitions(t *testing.T) {
 				Offset:      int64(i),
 				Message:     &kafka.Message{Key: []byte{byte(p)}, Value: []byte("test")},
 				ProcessFunc: processFunc,
-				Attempt:     0,
 			}
 			err := wp.SubmitJob(ctx, job)
 			assert.NoError(t, err)
@@ -370,39 +365,6 @@ func TestWorkerPool_MultiplePartitions(t *testing.T) {
 		assert.Equal(t, int32(jobsPerPartition), count,
 			"Partition %d processed %d jobs, expected %d", p, count, jobsPerPartition)
 	}
-}
-
-// TestWorkerPool_RetryAttempts tests that retry attempt counter is preserved
-func TestWorkerPool_RetryAttempts(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	wp := burrow.NewWorkerPool(5, 100, 100, logger)
-
-	wp.Start()
-	defer wp.Stop()
-
-	ctx := context.Background()
-
-	// Process function that always fails
-	processFunc := func(ctx context.Context, msg *kafka.Message) error {
-		return assert.AnError
-	}
-
-	// Submit job with retry attempt
-	expectedAttempt := 3
-	job := &burrow.Job{
-		Partition:   0,
-		Offset:      0,
-		Message:     &kafka.Message{Value: []byte("test")},
-		ProcessFunc: processFunc,
-		Attempt:     expectedAttempt,
-	}
-	err := wp.SubmitJob(ctx, job)
-	assert.NoError(t, err)
-
-	// Verify result has correct attempt number
-	result := <-wp.Results()
-	assert.False(t, result.Success)
-	assert.Equal(t, expectedAttempt, result.Attempt)
 }
 
 // TestWorkerPool_GracefulStop tests clean shutdown
@@ -429,7 +391,6 @@ func TestWorkerPool_GracefulStop(t *testing.T) {
 			Offset:      int64(i),
 			Message:     &kafka.Message{Value: []byte("test")},
 			ProcessFunc: processFunc,
-			Attempt:     0,
 		}
 		wp.SubmitJob(ctx, job)
 	}
@@ -474,7 +435,6 @@ func TestWorkerPool_StressTest(t *testing.T) {
 			Offset:      int64(i),
 			Message:     &kafka.Message{Value: []byte("test")},
 			ProcessFunc: processFunc,
-			Attempt:     0,
 		}
 		err := wp.SubmitJob(ctx, job)
 		assert.NoError(t, err)

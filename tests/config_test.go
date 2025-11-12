@@ -20,12 +20,9 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 1000, config.ResultQueueSize, "Default ResultQueueSize should be 1000")
 	assert.Equal(t, 5*time.Second, config.CommitInterval, "Default CommitInterval should be 5s")
 	assert.Equal(t, 1000, config.CommitBatchSize, "Default CommitBatchSize should be 1000")
-	assert.Equal(t, 10, config.MaxConsecutiveErrors, "Default MaxConsecutiveErrors should be 10")
-	assert.Equal(t, 3, config.MaxRetries, "Default MaxRetries should be 3")
-	assert.Equal(t, 100*time.Millisecond, config.RetryBackoffBase, "Default RetryBackoffBase should be 100ms")
+	assert.Equal(t, burrow.FatalOnError, config.OnError, "Default OnError should be FatalOnError")
 	assert.NotNil(t, config.Logger, "Logger should not be nil")
 	assert.False(t, config.EnableMetrics, "EnableMetrics should default to false")
-	assert.False(t, config.EnableOrderedProcessing, "EnableOrderedProcessing should default to false")
 	assert.Equal(t, 30*time.Second, config.ShutdownTimeout, "Default ShutdownTimeout should be 30s")
 }
 
@@ -130,18 +127,15 @@ func TestConfig_Validate_AllInvalid(t *testing.T) {
 func TestConfig_CustomValues(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	config := burrow.Config{
-		NumWorkers:              100,
-		JobQueueSize:            5000,
-		ResultQueueSize:         5000,
-		CommitInterval:          10 * time.Second,
-		CommitBatchSize:         500,
-		MaxConsecutiveErrors:    20,
-		MaxRetries:              5,
-		RetryBackoffBase:        200 * time.Millisecond,
-		Logger:                  logger,
-		EnableMetrics:           true,
-		EnableOrderedProcessing: true,
-		ShutdownTimeout:         60 * time.Second,
+		NumWorkers:      100,
+		JobQueueSize:    5000,
+		ResultQueueSize: 5000,
+		CommitInterval:  10 * time.Second,
+		CommitBatchSize: 500,
+		OnError:         burrow.FreezeOnError,
+		Logger:          logger,
+		EnableMetrics:   true,
+		ShutdownTimeout: 60 * time.Second,
 	}
 
 	// Should validate successfully
@@ -152,8 +146,8 @@ func TestConfig_CustomValues(t *testing.T) {
 	assert.Equal(t, 100, config.NumWorkers)
 	assert.Equal(t, 5000, config.JobQueueSize)
 	assert.Equal(t, 10*time.Second, config.CommitInterval)
+	assert.Equal(t, burrow.FreezeOnError, config.OnError)
 	assert.True(t, config.EnableMetrics)
-	assert.True(t, config.EnableOrderedProcessing)
 }
 
 // TestConfig_MinimalConfig tests minimal valid configuration
@@ -176,16 +170,14 @@ func TestConfig_EdgeCaseValues(t *testing.T) {
 
 	t.Run("very large values", func(t *testing.T) {
 		config := burrow.Config{
-			NumWorkers:           10000,
-			JobQueueSize:         1000000,
-			ResultQueueSize:      1000000,
-			CommitInterval:       24 * time.Hour,
-			CommitBatchSize:      1000000,
-			MaxConsecutiveErrors: 100000,
-			MaxRetries:           100,
-			RetryBackoffBase:     10 * time.Minute,
-			Logger:               logger,
-			ShutdownTimeout:      24 * time.Hour,
+			NumWorkers:      10000,
+			JobQueueSize:    1000000,
+			ResultQueueSize: 1000000,
+			CommitInterval:  24 * time.Hour,
+			CommitBatchSize: 1000000,
+			OnError:         burrow.FreezeOnError,
+			Logger:          logger,
+			ShutdownTimeout: 24 * time.Hour,
 		}
 
 		err := config.Validate()
@@ -194,16 +186,14 @@ func TestConfig_EdgeCaseValues(t *testing.T) {
 
 	t.Run("very small positive values", func(t *testing.T) {
 		config := burrow.Config{
-			NumWorkers:           1,
-			JobQueueSize:         1,
-			ResultQueueSize:      1,
-			CommitInterval:       1 * time.Nanosecond,
-			CommitBatchSize:      1,
-			MaxConsecutiveErrors: 1,
-			MaxRetries:           0,
-			RetryBackoffBase:     1 * time.Nanosecond,
-			Logger:               logger,
-			ShutdownTimeout:      1 * time.Nanosecond,
+			NumWorkers:      1,
+			JobQueueSize:    1,
+			ResultQueueSize: 1,
+			CommitInterval:  1 * time.Nanosecond,
+			CommitBatchSize: 1,
+			OnError:         burrow.FatalOnError,
+			Logger:          logger,
+			ShutdownTimeout: 1 * time.Nanosecond,
 		}
 
 		err := config.Validate()
@@ -215,18 +205,15 @@ func TestConfig_EdgeCaseValues(t *testing.T) {
 func TestConfig_ZeroValues(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	config := burrow.Config{
-		NumWorkers:              1,
-		Logger:                  logger,
-		CommitInterval:          1 * time.Second,
-		JobQueueSize:            0, // Can be zero
-		ResultQueueSize:         0, // Can be zero
-		CommitBatchSize:         0, // Can be zero
-		MaxConsecutiveErrors:    0, // Can be zero (will halt immediately)
-		MaxRetries:              0, // Can be zero (no retries)
-		RetryBackoffBase:        0, // Can be zero
-		ShutdownTimeout:         0, // Can be zero
-		EnableMetrics:           false,
-		EnableOrderedProcessing: false,
+		NumWorkers:      1,
+		Logger:          logger,
+		CommitInterval:  1 * time.Second,
+		JobQueueSize:    0, // Can be zero
+		ResultQueueSize: 0, // Can be zero
+		CommitBatchSize: 0, // Can be zero
+		OnError:         burrow.FatalOnError,
+		ShutdownTimeout: 0, // Can be zero
+		EnableMetrics:   false,
 	}
 
 	err := config.Validate()
@@ -323,7 +310,7 @@ func TestConfig_PartialDefaultOverride(t *testing.T) {
 
 	// Verify non-overridden defaults remain
 	assert.Equal(t, 1000, config.JobQueueSize)
-	assert.Equal(t, 10, config.MaxConsecutiveErrors)
+	assert.Equal(t, burrow.FatalOnError, config.OnError)
 }
 
 // TestConfig_ReasonableProductionValues tests production-ready configuration
@@ -332,18 +319,15 @@ func TestConfig_ReasonableProductionValues(t *testing.T) {
 	defer logger.Sync()
 
 	config := burrow.Config{
-		NumWorkers:              100,
-		JobQueueSize:            10000,
-		ResultQueueSize:         10000,
-		CommitInterval:          5 * time.Second,
-		CommitBatchSize:         5000,
-		MaxConsecutiveErrors:    10,
-		MaxRetries:              3,
-		RetryBackoffBase:        100 * time.Millisecond,
-		Logger:                  logger,
-		EnableMetrics:           true,
-		EnableOrderedProcessing: false,
-		ShutdownTimeout:         30 * time.Second,
+		NumWorkers:      100,
+		JobQueueSize:    10000,
+		ResultQueueSize: 10000,
+		CommitInterval:  5 * time.Second,
+		CommitBatchSize: 5000,
+		OnError:         burrow.FatalOnError,
+		Logger:          logger,
+		EnableMetrics:   true,
+		ShutdownTimeout: 30 * time.Second,
 	}
 
 	err := config.Validate()
@@ -356,18 +340,15 @@ func TestConfig_HighThroughputValues(t *testing.T) {
 	defer logger.Sync()
 
 	config := burrow.Config{
-		NumWorkers:              500,
-		JobQueueSize:            50000,
-		ResultQueueSize:         50000,
-		CommitInterval:          1 * time.Second,
-		CommitBatchSize:         10000,
-		MaxConsecutiveErrors:    50,
-		MaxRetries:              2,
-		RetryBackoffBase:        50 * time.Millisecond,
-		Logger:                  logger,
-		EnableMetrics:           true,
-		EnableOrderedProcessing: false,
-		ShutdownTimeout:         60 * time.Second,
+		NumWorkers:      500,
+		JobQueueSize:    50000,
+		ResultQueueSize: 50000,
+		CommitInterval:  1 * time.Second,
+		CommitBatchSize: 10000,
+		OnError:         burrow.FatalOnError,
+		Logger:          logger,
+		EnableMetrics:   true,
+		ShutdownTimeout: 60 * time.Second,
 	}
 
 	err := config.Validate()

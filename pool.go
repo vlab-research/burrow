@@ -18,11 +18,12 @@ type Pool struct {
 	config          Config
 	workerPool      *WorkerPool
 	commitManager   *CommitManager
-	errorTracker    *ErrorTracker
 	sequenceTracker *SequenceTracker // Single tracker for all partitions
 	logger          *zap.Logger
 	ctx             context.Context
 	cancel          context.CancelFunc
+	pollCtx         context.Context      // Context for poll loop
+	pollCancel      context.CancelFunc   // Cancel function to stop polling
 	wg              sync.WaitGroup
 	rebalanceCb     kafka.RebalanceCb
 
@@ -40,18 +41,13 @@ func NewPool(consumer *kafka.Consumer, config Config) (*Pool, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	pollCtx, pollCancel := context.WithCancel(context.Background())
 
 	// Create worker pool
 	workerPool := NewWorkerPool(
 		config.NumWorkers,
 		config.JobQueueSize,
 		config.ResultQueueSize,
-		config.Logger,
-	)
-
-	// Create error tracker
-	errorTracker := NewErrorTracker(
-		config.MaxConsecutiveErrors,
 		config.Logger,
 	)
 
@@ -62,11 +58,12 @@ func NewPool(consumer *kafka.Consumer, config Config) (*Pool, error) {
 		consumer:        consumer,
 		config:          config,
 		workerPool:      workerPool,
-		errorTracker:    errorTracker,
 		sequenceTracker: sequenceTracker,
 		logger:          config.Logger,
 		ctx:             ctx,
 		cancel:          cancel,
+		pollCtx:         pollCtx,
+		pollCancel:      pollCancel,
 	}
 
 	// Create commit manager with sequence tracker
@@ -127,6 +124,10 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-p.pollCtx.Done():
+			// Poll context cancelled (FreezeOnError stopped polling)
+			p.logger.Info("poll loop stopped due to error freeze")
+			return p.pollCtx.Err()
 
 		default:
 			// Poll Kafka (100ms timeout)
@@ -154,7 +155,6 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 				Offset:      int64(msg.TopicPartition.Offset),
 				Message:     msg,
 				ProcessFunc: processFunc,
-				Attempt:     0,
 			}
 
 			// Record inflight with sequence
@@ -177,7 +177,6 @@ func (p *Pool) processResults() {
 		if result.Success {
 			// Success!
 			p.sequenceTracker.MarkProcessed(result.Sequence)
-			p.errorTracker.RecordSuccess()
 			atomic.AddInt64(&p.statsMessagesProcessed, 1)
 
 			p.logger.Debug("message processed successfully",
@@ -186,82 +185,54 @@ func (p *Pool) processResults() {
 				zap.Int64("offset", result.Offset))
 
 		} else {
-			// Failure - handle retry or permanent failure
-			p.handleFailure(result)
+			// Failure - app returned error, something is seriously wrong
+			p.handleError(result)
+			return // Stop processing results
 		}
 	}
 }
 
-// handleFailure handles a failed message (retry or permanent failure)
-func (p *Pool) handleFailure(result *Result) {
-	// Check if retriable
-	if result.Attempt < p.config.MaxRetries && isRetriable(result.Error) {
-		// Retry with backoff
-		backoff := calculateBackoff(result.Attempt, p.config.RetryBackoffBase)
+// handleError handles a processing error based on configured behavior
+func (p *Pool) handleError(result *Result) {
+	p.logger.Error("message processing failed",
+		zap.Int64("sequence", result.Sequence),
+		zap.Int32("partition", result.Partition),
+		zap.Int64("offset", result.Offset),
+		zap.Error(result.Error))
 
-		p.logger.Info("retrying message",
+	atomic.AddInt64(&p.statsMessagesFailed, 1)
+
+	switch p.config.OnError {
+	case FatalOnError:
+		// Blow up immediately - no graceful shutdown
+		p.logger.Fatal("exiting immediately due to processing error",
 			zap.Int64("sequence", result.Sequence),
-			zap.Int32("partition", result.Partition),
-			zap.Int64("offset", result.Offset),
-			zap.Int("attempt", result.Attempt+1),
-			zap.Int("max_retries", p.config.MaxRetries),
-			zap.Duration("backoff", backoff),
 			zap.Error(result.Error))
+		// Fatal calls os.Exit(1)
 
-		// Schedule retry with proper context handling
-		// IMPORTANT: Keep the same sequence number for retry
-		retryJob := &Job{
-			Sequence:    result.Sequence,
-			Partition:   result.Partition,
-			Offset:      result.Offset,
-			Message:     result.Job.Message,
-			ProcessFunc: result.Job.ProcessFunc,
-			Attempt:     result.Attempt + 1,
-		}
-
-		// Launch goroutine with proper cleanup
-		go func(job *Job) {
-			select {
-			case <-time.After(backoff):
-				// Try to submit retry job
-				if err := p.workerPool.SubmitJob(p.ctx, job); err != nil {
-					// Context cancelled or other error - mark as failed
-					p.logger.Warn("failed to submit retry job",
-						zap.Int64("sequence", job.Sequence),
-						zap.Int32("partition", job.Partition),
-						zap.Int64("offset", job.Offset),
-						zap.Error(err))
-					p.sequenceTracker.MarkFailed(job.Sequence)
-				}
-			case <-p.ctx.Done():
-				// Context cancelled - mark as failed
-				p.logger.Debug("retry cancelled due to context",
-					zap.Int64("sequence", job.Sequence),
-					zap.Int32("partition", job.Partition),
-					zap.Int64("offset", job.Offset))
-				p.sequenceTracker.MarkFailed(job.Sequence)
-				return
-			}
-		}(retryJob)
-
-	} else {
-		// Permanent failure - mark as failed (leaves gap)
+	case FreezeOnError:
+		// Mark as failed (creates gap, blocks commits past this point)
 		p.sequenceTracker.MarkFailed(result.Sequence)
-		atomic.AddInt64(&p.statsMessagesFailed, 1)
 
-		p.logger.Error("permanent message failure",
-			zap.Int64("sequence", result.Sequence),
-			zap.Int32("partition", result.Partition),
-			zap.Int64("offset", result.Offset),
-			zap.Int("attempts", result.Attempt+1),
+		// Stop polling new messages
+		p.pollCancel()
+
+		// Wait for inflight to complete
+		p.logger.Info("waiting for inflight messages to complete")
+		err := p.sequenceTracker.WaitForInflight(context.Background(), p.config.ShutdownTimeout)
+		if err != nil {
+			p.logger.Error("timeout waiting for inflight", zap.Error(err))
+		}
+
+		// Final commit (up to the gap)
+		p.commitManager.tryCommit(context.Background())
+
+		p.logger.Error("consumer frozen due to processing error - manual restart required",
+			zap.Int64("failed_sequence", result.Sequence),
 			zap.Error(result.Error))
 
-		// Check error threshold
-		shouldHalt := p.errorTracker.RecordError(result.Partition, result.Offset, result.Error)
-		if shouldHalt {
-			p.logger.Error("error threshold exceeded, halting pool")
-			p.cancel() // Halt processing
-		}
+		// Freeze forever (block until external signal)
+		select {}
 	}
 }
 

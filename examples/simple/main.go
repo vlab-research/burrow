@@ -58,13 +58,11 @@ func main() {
 	// Optional: Customize other settings
 	// config.CommitInterval = 10 * time.Second    // Commit every 10 seconds
 	// config.CommitBatchSize = 1000                // OR commit every 1000 messages
-	// config.MaxConsecutiveErrors = 5              // Halt after 5 consecutive errors
-	// config.MaxRetries = 3                        // Retry failed messages 3 times
+	// config.OnError = burrow.FreezeOnError        // Freeze on error (default: FatalOnError)
 
 	logger.Info("burrow configuration",
 		zap.Int("num_workers", config.NumWorkers),
-		zap.Duration("commit_interval", config.CommitInterval),
-		zap.Int("max_consecutive_errors", config.MaxConsecutiveErrors))
+		zap.Duration("commit_interval", config.CommitInterval))
 
 	// Step 4: Create the Burrow pool
 	pool, err := burrow.NewPool(consumer, config)
@@ -83,7 +81,7 @@ func main() {
 			logger.Error("failed to unmarshal message",
 				zap.Error(err),
 				zap.String("value", string(msg.Value)))
-			return err // Returning error will trigger retry
+			return err // Returning error will trigger error handling (fatal or freeze)
 		}
 
 		// Do your I/O-heavy work here
@@ -183,7 +181,7 @@ Key Features Demonstrated:
 - At-least-once delivery (messages never lost)
 - Ordered offset commits (no gaps)
 - Graceful shutdown with final commit
-- Error handling with retry logic
+- Configurable error handling (fatal or freeze)
 - Production-ready logging
 
 Performance Benefits:

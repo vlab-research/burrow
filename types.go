@@ -22,7 +22,6 @@ type Job struct {
 	Offset      int64
 	Message     *kafka.Message
 	ProcessFunc ProcessFunc
-	Attempt     int // Retry attempt number
 }
 
 // Result represents the outcome of processing a job
@@ -32,8 +31,6 @@ type Result struct {
 	Offset    int64
 	Success   bool
 	Error     error
-	Attempt   int
-	Job       *Job // Original job for retry
 }
 
 // Stats contains runtime statistics

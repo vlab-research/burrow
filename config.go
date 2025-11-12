@@ -8,6 +8,22 @@ import (
 	"go.uber.org/zap"
 )
 
+// OnErrorBehavior defines what happens when message processing returns an error
+type OnErrorBehavior int
+
+const (
+	// FreezeOnError stops polling new messages, waits for inflight to complete,
+	// commits up to the failed message, then blocks forever.
+	// Requires external restart (K8s, systemd, etc.)
+	// Use this when you want to investigate before restarting.
+	FreezeOnError OnErrorBehavior = iota
+
+	// FatalOnError immediately exits the process with os.Exit(1) on first error.
+	// No graceful shutdown, no waiting for inflight.
+	// Use this for fast failure and immediate restart (with crash loop backoff).
+	FatalOnError
+)
+
 // Config contains configuration for the Pool
 type Config struct {
 	// Worker pool configuration
@@ -20,34 +36,28 @@ type Config struct {
 	CommitBatchSize int           // Max messages before forcing commit (default: 1000)
 
 	// Error handling
-	MaxConsecutiveErrors int           // Max consecutive errors before halt (default: 10)
-	MaxRetries           int           // Max retries per message (default: 3)
-	RetryBackoffBase     time.Duration // Base backoff duration (default: 100ms)
+	OnError OnErrorBehavior // Behavior when processFunc returns error (default: FreezeOnError)
 
 	// Logging and metrics
 	Logger        *zap.Logger // Logger instance (required)
 	EnableMetrics bool        // Enable Prometheus metrics (default: false)
 
 	// Advanced options
-	EnableOrderedProcessing bool          // Ensure per-partition ordering (default: false)
-	ShutdownTimeout         time.Duration // Graceful shutdown timeout (default: 30s)
+	ShutdownTimeout time.Duration // Graceful shutdown timeout (default: 30s)
 }
 
 // DefaultConfig returns a config with sensible defaults
 func DefaultConfig(logger *zap.Logger) Config {
 	return Config{
-		NumWorkers:              10,
-		JobQueueSize:            1000,
-		ResultQueueSize:         1000,
-		CommitInterval:          5 * time.Second,
-		CommitBatchSize:         1000,
-		MaxConsecutiveErrors:    10,
-		MaxRetries:              3,
-		RetryBackoffBase:        100 * time.Millisecond,
-		Logger:                  logger,
-		EnableMetrics:           false,
-		EnableOrderedProcessing: false,
-		ShutdownTimeout:         30 * time.Second,
+		NumWorkers:      10,
+		JobQueueSize:    1000,
+		ResultQueueSize: 1000,
+		CommitInterval:  5 * time.Second,
+		CommitBatchSize: 1000,
+		OnError:         FatalOnError, // Blow up immediately on error (fast failure)
+		Logger:          logger,
+		EnableMetrics:   false,
+		ShutdownTimeout: 30 * time.Second,
 	}
 }
 

@@ -258,71 +258,43 @@ func TestIntegration_RebalancingSafety(t *testing.T) {
 }
 
 // ============================================================================
-// TEST 4: Error Threshold Halt (MAJOR)
+// TEST 4: Error Handling - Gap Creation (MAJOR)
 // ============================================================================
-// Test that consecutive errors trigger halt
-// - MaxConsecutiveErrors = 3
-// - Pattern: [Fail, Fail, Success, Fail, Fail, Fail]
-// - Verify: halts after 3rd consecutive failure
-// - Verify: No commits past gaps
+// Test that errors create gaps that block commits
+// - Process messages [0,1,2,3,4]
+// - Message 2 fails (creates gap)
+// - Messages 3, 4 succeed but can't be committed
+// - Verify committable is blocked by gap
 // ============================================================================
 
-func TestIntegration_ErrorThresholdHalt(t *testing.T) {
+func TestIntegration_ErrorCreatesGap(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	errorTracker := burrow.NewErrorTracker(3, logger) // Max 3 consecutive errors
-	offsetTracker := burrow.NewSequenceTracker(logger)
+	tracker := burrow.NewSequenceTracker(logger)
 
-	// Test pattern: [Fail, Fail, Success, Fail, Fail, Fail]
-	type testStep struct {
-		offset      int64
-		shouldFail  bool
-		shouldHalt  bool
-		description string
-	}
-
-	steps := []testStep{
-		{0, true, false, "First failure"},
-		{1, true, false, "Second consecutive failure"},
-		{2, false, false, "Success - resets counter"},
-		{3, true, false, "First failure after reset"},
-		{4, true, false, "Second consecutive failure"},
-		{5, true, true, "Third consecutive failure - SHOULD HALT"},
-	}
-
-	// Assign sequences for all steps
-	sequences := make([]int64, len(steps))
-	for i, step := range steps {
-		seq := offsetTracker.AssignSequence(0, step.offset) // partition 0
+	// Assign sequences for messages 0, 1, 2, 3, 4
+	sequences := make([]int64, 5)
+	for i := int64(0); i <= 4; i++ {
+		seq := tracker.AssignSequence(0, i) // partition 0, offset i
 		sequences[i] = seq
-		offsetTracker.RecordInflight(seq)
-
-		if step.shouldFail {
-			offsetTracker.MarkFailed(seq)
-			shouldHalt := errorTracker.RecordError(0, step.offset, errors.New("test error"))
-			assert.Equal(t, step.shouldHalt, shouldHalt,
-				"Step %d (%s): halt expectation mismatch", step.offset, step.description)
-		} else {
-			offsetTracker.MarkProcessed(seq)
-			errorTracker.RecordSuccess()
-		}
-
-		// Check error count
-		consecutive, _ := errorTracker.GetStats()
-		t.Logf("After offset %d (%s): consecutive errors = %d", step.offset, step.description, consecutive)
+		tracker.RecordInflight(seq)
 	}
 
-	// Verify consecutive error count
-	consecutive, total := errorTracker.GetStats()
-	assert.Equal(t, 3, consecutive, "Should have 3 consecutive errors")
-	assert.Equal(t, int64(5), total, "Should have 5 total errors")
+	// Messages 0, 1 succeed
+	tracker.MarkProcessed(sequences[0])
+	tracker.MarkProcessed(sequences[1])
 
-	// Verify committable sequence - should only commit up to sequence 1 (before first failure after reset)
-	// Sequences 0, 1 failed, 2 succeeded, 3-5 failed
-	// With gaps at 0, 1, 3, 4, 5 and only 2 processed, committable should be -1 (no contiguous from start)
-	committable := offsetTracker.GetCommittableSequence()
-	assert.Equal(t, int64(-1), committable, "Should not commit anything due to gaps at beginning")
+	// Message 2 FAILS (creates gap)
+	tracker.MarkFailed(sequences[2])
 
-	t.Log("Error threshold halt verified - halts after 3 consecutive errors")
+	// Messages 3, 4 succeed (but blocked by gap at 2)
+	tracker.MarkProcessed(sequences[3])
+	tracker.MarkProcessed(sequences[4])
+
+	// Verify committable sequence is only 1 (blocked by gap at 2)
+	committable := tracker.GetCommittableSequence()
+	assert.Equal(t, sequences[1], committable, "Should only commit up to sequence 1 (gap at 2)")
+
+	t.Log("Error gap verified - failed message blocks commits")
 }
 
 // ============================================================================
@@ -524,15 +496,13 @@ func TestIntegration_FullPoolFlow(t *testing.T) {
 
 	// Create config
 	config := burrow.Config{
-		NumWorkers:            10,
-		JobQueueSize:          100,
-		ResultQueueSize:       100,
-		MaxRetries:            3,
-		RetryBackoffBase:      100 * time.Millisecond,
-		MaxConsecutiveErrors:  5,
-		CommitInterval:        1 * time.Second,
-		CommitBatchSize:       10,
-		Logger:                logger,
+		NumWorkers:      10,
+		JobQueueSize:    100,
+		ResultQueueSize: 100,
+		OnError:         burrow.FatalOnError,
+		CommitInterval:  1 * time.Second,
+		CommitBatchSize: 10,
+		Logger:          logger,
 	}
 
 	// Note: We can't easily test the full Pool without a real Kafka consumer
