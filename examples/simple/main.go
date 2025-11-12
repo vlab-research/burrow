@@ -24,10 +24,10 @@ func main() {
 	// Step 1: Create a standard Kafka consumer
 	// IMPORTANT: Set enable.auto.commit to false - Burrow handles commits
 	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  "localhost:9092",     // Your Kafka broker address
-		"group.id":           "burrow-example",     // Consumer group ID
-		"auto.offset.reset":  "earliest",           // Start from beginning if no offset
-		"enable.auto.commit": false,                // CRITICAL: Let Burrow handle commits
+		"bootstrap.servers":  "localhost:9092", // Your Kafka broker address
+		"group.id":           "burrow-example", // Consumer group ID
+		"auto.offset.reset":  "earliest",       // Start from beginning if no offset
+		"enable.auto.commit": false,            // CRITICAL: Let Burrow handle commits
 	})
 	if err != nil {
 		log.Fatalf("Failed to create consumer: %v", err)
