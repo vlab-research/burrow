@@ -59,11 +59,6 @@ func (st *SequenceTracker) AssignSequence(partition int32, offset int64) int64 {
 		st.highWatermark = seq
 	}
 
-	st.logger.Debug("assigned sequence",
-		zap.Int64("sequence", seq),
-		zap.Int32("partition", partition),
-		zap.Int64("offset", offset))
-
 	return seq
 }
 
@@ -71,39 +66,22 @@ func (st *SequenceTracker) AssignSequence(partition int32, offset int64) int64 {
 func (st *SequenceTracker) RecordInflight(seq int64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-
 	st.inflightMap[seq] = true
-
-	st.logger.Debug("recorded inflight",
-		zap.Int64("sequence", seq),
-		zap.Int("inflight_count", len(st.inflightMap)))
 }
 
 // MarkProcessed marks a sequence as successfully completed
 func (st *SequenceTracker) MarkProcessed(seq int64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-
 	st.processedMap[seq] = true
 	delete(st.inflightMap, seq)
-
-	st.logger.Debug("marked processed",
-		zap.Int64("sequence", seq),
-		zap.Int("inflight", len(st.inflightMap)),
-		zap.Int("processed", len(st.processedMap)))
 }
 
 // MarkFailed marks a sequence as failed (leaves a gap for at-least-once semantics)
 func (st *SequenceTracker) MarkFailed(seq int64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-
-	// Don't mark as processed - this creates a gap!
-	delete(st.inflightMap, seq)
-
-	st.logger.Warn("marked failed",
-		zap.Int64("sequence", seq),
-		zap.Int("inflight", len(st.inflightMap)))
+	delete(st.inflightMap, seq) // Don't mark as processed - creates a gap
 }
 
 // GetCommittableSequence returns the highest sequence that can be safely committed
@@ -144,16 +122,10 @@ func (st *SequenceTracker) GetCommittableOffsets() map[int32]int64 {
 		}
 	}
 
-	st.logger.Info("computed committable offsets",
-		zap.Int64("committable_sequence", committableSeq),
-		zap.Int64("last_committed", st.lastCommitted),
-		zap.Any("offsets_by_partition", offsetsByPartition))
-
 	return offsetsByPartition
 }
 
 // CommitSequence updates the last committed sequence and cleans up old data
-// to prevent memory leaks
 func (st *SequenceTracker) CommitSequence(seq int64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -167,10 +139,6 @@ func (st *SequenceTracker) CommitSequence(seq int64) {
 			delete(st.messages, s)
 		}
 	}
-
-	st.logger.Info("committed sequence",
-		zap.Int64("sequence", seq),
-		zap.Int("remaining_tracked", len(st.processedMap)))
 }
 
 // GetInflightCount returns the number of messages currently being processed

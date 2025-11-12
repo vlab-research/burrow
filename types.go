@@ -17,20 +17,14 @@ type MessageInfo struct {
 
 // Job represents a message to be processed by a worker
 type Job struct {
-	Sequence    int64 // Global sequence number for sequential tracking
-	Partition   int32
-	Offset      int64
-	Message     *kafka.Message
-	ProcessFunc ProcessFunc
+	Sequence int64
+	Message  *kafka.Message
 }
 
 // Result represents the outcome of processing a job
 type Result struct {
-	Sequence  int64 // Global sequence number for sequential tracking
-	Partition int32
-	Offset    int64
-	Success   bool
-	Error     error
+	Sequence int64
+	Error    error
 }
 
 // Stats contains runtime statistics

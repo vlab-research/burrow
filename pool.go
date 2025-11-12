@@ -16,18 +16,27 @@ import (
 type Pool struct {
 	consumer        *kafka.Consumer
 	config          Config
-	workerPool      *WorkerPool
-	commitManager   *CommitManager
-	sequenceTracker *SequenceTracker // Single tracker for all partitions
+	sequenceTracker *SequenceTracker
+	processFunc     ProcessFunc
 	logger          *zap.Logger
-	ctx             context.Context
-	cancel          context.CancelFunc
-	pollCtx         context.Context      // Context for poll loop
-	pollCancel      context.CancelFunc   // Cancel function to stop polling
-	wg              sync.WaitGroup
-	rebalanceCb     kafka.RebalanceCb
 
-	// Statistics (atomic counters)
+	// Channels
+	jobs    chan *Job
+	results chan *Result
+
+	// Lifecycle
+	ctx        context.Context
+	cancel     context.CancelFunc
+	pollCtx    context.Context
+	pollCancel context.CancelFunc
+	wg         sync.WaitGroup
+
+	rebalanceCb kafka.RebalanceCb
+
+	// Commit tracking
+	messagesSinceCommit int64
+
+	// Statistics
 	statsMessagesProcessed int64
 	statsMessagesFailed    int64
 	statsOffsetsCommitted  int64
@@ -35,7 +44,6 @@ type Pool struct {
 
 // NewPool creates a new Burrow pool
 func NewPool(consumer *kafka.Consumer, config Config) (*Pool, error) {
-	// Validate config
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -43,60 +51,44 @@ func NewPool(consumer *kafka.Consumer, config Config) (*Pool, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	pollCtx, pollCancel := context.WithCancel(context.Background())
 
-	// Create worker pool
-	workerPool := NewWorkerPool(
-		config.NumWorkers,
-		config.JobQueueSize,
-		config.ResultQueueSize,
-		config.Logger,
-	)
-
-	// Create sequence tracker
-	sequenceTracker := NewSequenceTracker(config.Logger)
-
 	pool := &Pool{
 		consumer:        consumer,
 		config:          config,
-		workerPool:      workerPool,
-		sequenceTracker: sequenceTracker,
+		sequenceTracker: NewSequenceTracker(config.Logger),
 		logger:          config.Logger,
+		jobs:            make(chan *Job, config.JobQueueSize),
+		results:         make(chan *Result, config.ResultQueueSize),
 		ctx:             ctx,
 		cancel:          cancel,
 		pollCtx:         pollCtx,
 		pollCancel:      pollCancel,
 	}
 
-	// Create commit manager with sequence tracker
-	commitManager := NewCommitManager(
-		consumer,
-		sequenceTracker,
-		config.CommitInterval,
-		config.CommitBatchSize,
-		config.Logger,
-		&pool.statsOffsetsCommitted,
-	)
-	pool.commitManager = commitManager
-
-	// Setup rebalance callback
 	pool.setupRebalanceCallback()
-
 	return pool, nil
 }
 
 // Run starts the pool and processes messages until context is cancelled
 func (p *Pool) Run(ctx context.Context, processFunc ProcessFunc) error {
+	p.processFunc = processFunc
 	p.logger.Info("starting pool",
 		zap.Int("num_workers", p.config.NumWorkers),
 		zap.Duration("commit_interval", p.config.CommitInterval))
 
-	// Start worker pool
-	p.workerPool.Start()
+	// Start workers
+	for i := 0; i < p.config.NumWorkers; i++ {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			p.worker()
+		}()
+	}
 
-	// Start commit manager
+	// Start commit loop
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		p.commitManager.Start(p.ctx)
+		p.commitLoop()
 	}()
 
 	// Start result processor
@@ -112,10 +104,29 @@ func (p *Pool) Run(ctx context.Context, processFunc ProcessFunc) error {
 	// Cleanup
 	p.logger.Info("shutting down pool")
 	p.cancel()
+	close(p.jobs)
 	p.wg.Wait()
-	p.workerPool.Stop()
 
 	return err
+}
+
+// worker processes jobs from the jobs channel
+func (p *Pool) worker() {
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case job := <-p.jobs:
+			if job == nil {
+				return
+			}
+			err := p.processFunc(p.ctx, job.Message)
+			p.results <- &Result{
+				Sequence: job.Sequence,
+				Error:    err,
+			}
+		}
+	}
 }
 
 // pollLoop reads messages from Kafka and dispatches to workers
@@ -150,40 +161,33 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 
 			// Create job
 			job := &Job{
-				Sequence:    sequence,
-				Partition:   msg.TopicPartition.Partition,
-				Offset:      int64(msg.TopicPartition.Offset),
-				Message:     msg,
-				ProcessFunc: processFunc,
+				Sequence: sequence,
+				Message:  msg,
 			}
 
 			// Record inflight with sequence
 			p.sequenceTracker.RecordInflight(sequence)
 
-			// Submit to worker pool (blocks if queue is full - backpressure!)
-			if err := p.workerPool.SubmitJob(ctx, job); err != nil {
-				return err
+			// Submit to workers (blocks if queue is full - backpressure!)
+			select {
+			case p.jobs <- job:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 
 			// Record message for batch commit trigger
-			p.commitManager.RecordMessage()
+			atomic.AddInt64(&p.messagesSinceCommit, 1)
 		}
 	}
 }
 
 // processResults handles results from workers
 func (p *Pool) processResults() {
-	for result := range p.workerPool.Results() {
-		if result.Success {
+	for result := range p.results {
+		if result.Error == nil {
 			// Success!
 			p.sequenceTracker.MarkProcessed(result.Sequence)
 			atomic.AddInt64(&p.statsMessagesProcessed, 1)
-
-			p.logger.Debug("message processed successfully",
-				zap.Int64("sequence", result.Sequence),
-				zap.Int32("partition", result.Partition),
-				zap.Int64("offset", result.Offset))
-
 		} else {
 			// Failure - app returned error, something is seriously wrong
 			p.handleError(result)
@@ -196,8 +200,6 @@ func (p *Pool) processResults() {
 func (p *Pool) handleError(result *Result) {
 	p.logger.Error("message processing failed",
 		zap.Int64("sequence", result.Sequence),
-		zap.Int32("partition", result.Partition),
-		zap.Int64("offset", result.Offset),
 		zap.Error(result.Error))
 
 	atomic.AddInt64(&p.statsMessagesFailed, 1)
@@ -225,7 +227,7 @@ func (p *Pool) handleError(result *Result) {
 		}
 
 		// Final commit (up to the gap)
-		p.commitManager.tryCommit(context.Background())
+		p.commit(context.Background())
 
 		p.logger.Error("consumer frozen due to processing error - manual restart required",
 			zap.Int64("failed_sequence", result.Sequence),
@@ -236,6 +238,61 @@ func (p *Pool) handleError(result *Result) {
 	}
 }
 
+// commitLoop runs periodic commits
+func (p *Pool) commitLoop() {
+	ticker := time.NewTicker(p.config.CommitInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			p.commit(context.Background()) // Final commit
+			return
+		case <-ticker.C:
+			p.commit(p.ctx)
+		}
+
+		// Check batch size trigger
+		if atomic.LoadInt64(&p.messagesSinceCommit) >= int64(p.config.CommitBatchSize) {
+			p.commit(p.ctx)
+		}
+	}
+}
+
+// commit attempts to commit offsets
+func (p *Pool) commit(ctx context.Context) error {
+	offsetsByPartition := p.sequenceTracker.GetCommittableOffsets()
+	if len(offsetsByPartition) == 0 {
+		return nil
+	}
+
+	// Build Kafka commit payload (Kafka expects "next offset to read", so add 1)
+	offsets := make([]kafka.TopicPartition, 0, len(offsetsByPartition))
+	for partition, offset := range offsetsByPartition {
+		offsets = append(offsets, kafka.TopicPartition{
+			Partition: partition,
+			Offset:    kafka.Offset(offset + 1),
+		})
+	}
+
+	// Synchronous commit for safety
+	_, err := p.consumer.CommitOffsets(offsets)
+	if err != nil {
+		p.logger.Error("failed to commit offsets", zap.Error(err))
+		return err
+	}
+
+	// Update tracker with committed sequence
+	committableSeq := p.sequenceTracker.GetCommittableSequence()
+	p.sequenceTracker.CommitSequence(committableSeq)
+
+	// Reset counter and update stats
+	atomic.StoreInt64(&p.messagesSinceCommit, 0)
+	atomic.AddInt64(&p.statsOffsetsCommitted, int64(len(offsets)))
+
+	p.logger.Info("committed offsets", zap.Int("partitions", len(offsets)))
+	return nil
+}
 
 // setupRebalanceCallback configures partition rebalance handling
 func (p *Pool) setupRebalanceCallback() {
@@ -282,10 +339,9 @@ func (p *Pool) onPartitionsRevoked(partitions []kafka.TopicPartition) {
 	}
 
 	// Final commit before losing partitions
-	p.commitManager.tryCommit(p.ctx)
+	p.commit(p.ctx)
 
-	p.logger.Info("partitions cleanup complete",
-		zap.Int("count", len(partitions)))
+	p.logger.Info("partitions cleanup complete", zap.Int("count", len(partitions)))
 }
 
 // GetStats returns runtime statistics
