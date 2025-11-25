@@ -1,4 +1,4 @@
-module github.com/vlab-research/fly/burrow
+module github.com/vlab-research/burrow
 
 go 1.25
 
