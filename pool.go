@@ -155,6 +155,7 @@ func (p *Pool) pollLoop(ctx context.Context, processFunc ProcessFunc) error {
 
 			// Assign sequence number
 			sequence := p.sequenceTracker.AssignSequence(
+				msg.TopicPartition.Topic,
 				msg.TopicPartition.Partition,
 				int64(msg.TopicPartition.Offset),
 			)
@@ -261,17 +262,18 @@ func (p *Pool) commitLoop() {
 
 // commit attempts to commit offsets
 func (p *Pool) commit(ctx context.Context) error {
-	offsetsByPartition := p.sequenceTracker.GetCommittableOffsets()
-	if len(offsetsByPartition) == 0 {
+	committableInfos := p.sequenceTracker.GetCommittableOffsets()
+	if len(committableInfos) == 0 {
 		return nil
 	}
 
 	// Build Kafka commit payload (Kafka expects "next offset to read", so add 1)
-	offsets := make([]kafka.TopicPartition, 0, len(offsetsByPartition))
-	for partition, offset := range offsetsByPartition {
+	offsets := make([]kafka.TopicPartition, 0, len(committableInfos))
+	for _, info := range committableInfos {
 		offsets = append(offsets, kafka.TopicPartition{
-			Partition: partition,
-			Offset:    kafka.Offset(offset + 1),
+			Topic:     info.Topic,
+			Partition: info.Partition,
+			Offset:    kafka.Offset(info.Offset + 1),
 		})
 	}
 

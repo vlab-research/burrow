@@ -41,15 +41,16 @@ func NewSequenceTracker(logger *zap.Logger) *SequenceTracker {
 
 // AssignSequence assigns the next sequence number to a message
 // This method is thread-safe and uses atomic operations for the counter
-func (st *SequenceTracker) AssignSequence(partition int32, offset int64) int64 {
+func (st *SequenceTracker) AssignSequence(topic *string, partition int32, offset int64) int64 {
 	// Atomically increment and get the next sequence number
 	seq := atomic.AddInt64(&st.nextSequence, 1) - 1
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// Store the partition/offset mapping for this sequence
+	// Store the topic/partition/offset mapping for this sequence
 	st.messages[seq] = MessageInfo{
+		Topic:     topic,
 		Partition: partition,
 		Offset:    offset,
 	}
@@ -95,10 +96,10 @@ func (st *SequenceTracker) GetCommittableSequence() int64 {
 }
 
 // GetCommittableOffsets converts the committable sequence range into
-// partition offsets suitable for Kafka commit.
+// MessageInfo suitable for Kafka commit.
 // This aggregates all committable sequences and returns the highest offset
 // per partition that can be safely committed.
-func (st *SequenceTracker) GetCommittableOffsets() map[int32]int64 {
+func (st *SequenceTracker) GetCommittableOffsets() []MessageInfo {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -107,22 +108,29 @@ func (st *SequenceTracker) GetCommittableOffsets() map[int32]int64 {
 
 	// No progress since last commit
 	if committableSeq <= st.lastCommitted {
-		return make(map[int32]int64)
+		return nil
 	}
 
 	// Convert sequence range to highest offset per partition
-	offsetsByPartition := make(map[int32]int64)
+	// Key by partition since we can have messages from different partitions
+	offsetsByPartition := make(map[int32]MessageInfo)
 
 	for seq := st.lastCommitted + 1; seq <= committableSeq; seq++ {
 		if info, exists := st.messages[seq]; exists {
 			// Track the highest offset for each partition
-			if currentOffset, ok := offsetsByPartition[info.Partition]; !ok || info.Offset > currentOffset {
-				offsetsByPartition[info.Partition] = info.Offset
+			if current, ok := offsetsByPartition[info.Partition]; !ok || info.Offset > current.Offset {
+				offsetsByPartition[info.Partition] = info
 			}
 		}
 	}
 
-	return offsetsByPartition
+	// Convert map to slice
+	result := make([]MessageInfo, 0, len(offsetsByPartition))
+	for _, info := range offsetsByPartition {
+		result = append(result, info)
+	}
+
+	return result
 }
 
 // CommitSequence updates the last committed sequence and cleans up old data

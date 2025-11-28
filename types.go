@@ -9,8 +9,9 @@ import (
 // ProcessFunc is the user-defined function for processing a message
 type ProcessFunc func(context.Context, *kafka.Message) error
 
-// MessageInfo tracks partition/offset for a sequence number
+// MessageInfo tracks topic/partition/offset for a sequence number
 type MessageInfo struct {
+	Topic     *string
 	Partition int32
 	Offset    int64
 }
